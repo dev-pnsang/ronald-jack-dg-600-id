@@ -1,1 +1,6 @@
 requirements/
+src/Dg600ReaderPy/.venv/
+src/Dg600ReaderPy/.deps/
+__pycache__/
+*.pyc
+

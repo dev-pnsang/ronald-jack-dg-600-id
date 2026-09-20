@@ -290,6 +290,13 @@ def run_gui(defaults: argparse.Namespace) -> int:
             self.title("Ronald Jack DG-600-ID")
             self.geometry("1100x720")
             self.minsize(960, 600)
+            # macOS Aqua (Tk 8.5): Frame bg / white text / ttk.Button dễ "biến mất".
+            if sys.platform == "darwin":
+                self.tk.call("tk", "scaling", 1.0)
+                try:
+                    self.tk.call("::tk::unsupported::MacWindowStyle", "style", self._w, "document", "closeBox collapseBox resizable")
+                except tk.TclError:
+                    pass
             self.conn = None
             self.info = None
             self.users: list[dict] = []
@@ -302,89 +309,109 @@ def run_gui(defaults: argparse.Namespace) -> int:
             self._build()
             self.after(300, self.connect)
 
-        def _build(self):
-            header = tk.Frame(self, bg="#1B4F72", height=72)
-            header.pack(fill="x")
-            tk.Label(
-                header,
-                text="Đọc dữ liệu máy chấm công Ronald Jack DG-600-ID",
-                bg="#1B4F72",
-                fg="white",
-                font=("Helvetica", 16, "bold"),
-            ).pack(anchor="w", padx=18, pady=(12, 0))
-            tk.Label(
-                header,
-                text="Bản macOS/Windows/Linux  •  protocol ZK port 4370  •  không cần zkemkeeper.dll",
-                bg="#1B4F72",
-                fg="#D6EAF8",
-            ).pack(anchor="w", padx=18, pady=(2, 12))
+        def _btn(self, parent, text, command):
+            return tk.Button(
+                parent,
+                text=text,
+                command=command,
+                padx=10,
+                pady=4,
+                highlightthickness=0,
+            )
 
-            bar = tk.Frame(self, padx=12, pady=8)
+        def _build(self):
+            # Tiêu đề: dùng Label (bg tin cậy hơn Frame trên macOS Aqua).
+            tk.Label(
+                self,
+                text="Đọc dữ liệu máy chấm công Ronald Jack DG-600-ID",
+                anchor="w",
+                padx=16,
+                pady=10,
+                font=("Helvetica", 16, "bold"),
+                fg="#1B4F72",
+            ).pack(fill="x")
+            tk.Label(
+                self,
+                text="macOS/Windows/Linux  •  protocol ZK port 4370  •  không cần zkemkeeper.dll",
+                anchor="w",
+                padx=16,
+                pady=4,
+                fg="#555555",
+            ).pack(fill="x")
+
+            bar = tk.Frame(self, padx=12, pady=6)
             bar.pack(fill="x")
-            tk.Label(bar, text="IP").grid(row=0, column=0, sticky="w")
+            tk.Label(bar, text="IP", fg="#222222").grid(row=0, column=0, sticky="w")
             self.ip_var = tk.StringVar(value=defaults.ip)
-            tk.Entry(bar, textvariable=self.ip_var, width=16).grid(row=1, column=0, padx=(0, 8))
-            tk.Label(bar, text="Cổng").grid(row=0, column=1, sticky="w")
+            tk.Entry(bar, textvariable=self.ip_var, width=16).grid(row=1, column=0, padx=4, sticky="w")
+            tk.Label(bar, text="Cổng", fg="#222222").grid(row=0, column=1, sticky="w")
             self.port_var = tk.StringVar(value=str(defaults.port))
-            tk.Entry(bar, textvariable=self.port_var, width=8).grid(row=1, column=1, padx=(0, 8))
-            tk.Label(bar, text="Comm Key").grid(row=0, column=2, sticky="w")
+            tk.Entry(bar, textvariable=self.port_var, width=8).grid(row=1, column=1, padx=4, sticky="w")
+            tk.Label(bar, text="Comm Key", fg="#222222").grid(row=0, column=2, sticky="w")
             self.key_var = tk.StringVar(value=str(defaults.key))
-            tk.Entry(bar, textvariable=self.key_var, width=8).grid(row=1, column=2, padx=(0, 8))
-            ttk.Button(bar, text="Kết nối", command=self.connect).grid(row=1, column=3, padx=4)
-            ttk.Button(bar, text="Ngắt", command=self.disconnect).grid(row=1, column=4, padx=4)
-            ttk.Button(bar, text="Tải nhật ký", command=self.load_logs).grid(row=1, column=5, padx=4)
-            ttk.Button(bar, text="Tải nhân viên", command=self.load_users).grid(row=1, column=6, padx=4)
-            ttk.Button(bar, text="Đồng bộ giờ", command=self.sync_time).grid(row=1, column=7, padx=4)
-            ttk.Button(bar, text="Xuất CSV", command=self.export_csv).grid(row=1, column=8, padx=4)
+            tk.Entry(bar, textvariable=self.key_var, width=8).grid(row=1, column=2, padx=4, sticky="w")
+            self._btn(bar, "Kết nối", self.connect).grid(row=1, column=3, padx=3)
+            self._btn(bar, "Ngắt", self.disconnect).grid(row=1, column=4, padx=3)
+            self._btn(bar, "Tải nhật ký", self.load_logs).grid(row=1, column=5, padx=3)
+            self._btn(bar, "Tải nhân viên", self.load_users).grid(row=1, column=6, padx=3)
+            self._btn(bar, "Đồng bộ giờ", self.sync_time).grid(row=1, column=7, padx=3)
+            self._btn(bar, "Xuất CSV", self.export_csv).grid(row=1, column=8, padx=3)
+
+            opts = tk.Frame(self, padx=12, pady=2)
+            opts.pack(fill="x")
             tk.Checkbutton(
-                bar,
+                opts,
                 text="Realtime (tức thì)",
                 variable=self.live_var,
                 command=self.toggle_live,
-                fg="#27AE60",
-                font=("Helvetica", 10, "bold"),
-            ).grid(row=1, column=9, padx=8)
+                fg="#1E8449",
+                font=("Helvetica", 11, "bold"),
+            ).pack(side="left", padx=6)
             tk.Checkbutton(
-                bar,
+                opts,
                 text="Thông báo",
                 variable=self.notify_var,
-                fg="#2980B9",
-                font=("Helvetica", 10, "bold"),
-            ).grid(row=1, column=10, padx=8)
+                fg="#1A5276",
+                font=("Helvetica", 11, "bold"),
+            ).pack(side="left")
 
             self.info_var = tk.StringVar(value="Chưa kết nối.")
-            tk.Label(self, textvariable=self.info_var, anchor="w", padx=14, pady=6).pack(fill="x")
+            tk.Label(self, textvariable=self.info_var, anchor="w", padx=14, pady=4, fg="#222222").pack(fill="x")
             self.live_banner_var = tk.StringVar(value="Realtime sẽ bật sau khi kết nối.")
             tk.Label(
                 self,
                 textvariable=self.live_banner_var,
                 anchor="w",
                 padx=14,
-                pady=8,
-                bg="#E8F8F5",
-                fg="#16A085",
+                pady=6,
+                fg="#0E6655",
                 font=("Helvetica", 11, "bold"),
             ).pack(fill="x")
 
             filter_bar = tk.Frame(self, padx=12, pady=4)
             filter_bar.pack(fill="x")
-            tk.Label(filter_bar, text="Từ ngày (dd/mm/yyyy)").pack(side="left")
+            tk.Label(filter_bar, text="Từ ngày (dd/mm/yyyy)", fg="#222222").pack(side="left")
             self.from_var = tk.StringVar()
             tk.Entry(filter_bar, textvariable=self.from_var, width=12).pack(side="left", padx=6)
-            tk.Label(filter_bar, text="Đến").pack(side="left")
+            tk.Label(filter_bar, text="Đến", fg="#222222").pack(side="left")
             self.to_var = tk.StringVar()
             tk.Entry(filter_bar, textvariable=self.to_var, width=12).pack(side="left", padx=6)
-            tk.Label(filter_bar, text="Tìm").pack(side="left", padx=(12, 0))
+            tk.Label(filter_bar, text="Tìm", fg="#222222").pack(side="left", padx=12)
             self.search_var = tk.StringVar()
             tk.Entry(filter_bar, textvariable=self.search_var, width=20).pack(side="left", padx=6)
-            ttk.Button(filter_bar, text="Lọc", command=self.apply_filter).pack(side="left")
+            self._btn(filter_bar, "Lọc", self.apply_filter).pack(side="left")
             self.count_var = tk.StringVar()
-            tk.Label(filter_bar, textvariable=self.count_var).pack(side="left", padx=12)
+            tk.Label(filter_bar, textvariable=self.count_var, fg="#222222").pack(side="left", padx=12)
 
-            self.tabs = ttk.Notebook(self)
-            self.tabs.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-            log_frame = ttk.Frame(self.tabs)
-            user_frame = ttk.Frame(self.tabs)
+            body = tk.Frame(self)
+            body.pack(fill="both", expand=True, padx=10, pady=6)
+            body.rowconfigure(0, weight=1)
+            body.columnconfigure(0, weight=1)
+
+            self.tabs = ttk.Notebook(body)
+            self.tabs.grid(row=0, column=0, sticky="nsew")
+            log_frame = tk.Frame(self.tabs)
+            user_frame = tk.Frame(self.tabs)
             self.tabs.add(log_frame, text="Nhật ký chấm công")
             self.tabs.add(user_frame, text="Nhân viên")
 
@@ -402,16 +429,26 @@ def run_gui(defaults: argparse.Namespace) -> int:
             )
 
             self.status_var = tk.StringVar(value="Sẵn sàng.")
-            tk.Label(self, textvariable=self.status_var, anchor="w", padx=12, pady=6, relief="sunken").pack(fill="x")
+            tk.Label(
+                self,
+                textvariable=self.status_var,
+                anchor="w",
+                padx=12,
+                pady=6,
+                relief="sunken",
+                fg="#222222",
+            ).pack(fill="x")
 
         def _tree(self, parent, columns, headings, widths):
-            wrap = ttk.Frame(parent)
+            wrap = tk.Frame(parent)
             wrap.pack(fill="both", expand=True)
+            wrap.rowconfigure(0, weight=1)
+            wrap.columnconfigure(0, weight=1)
             tree = ttk.Treeview(wrap, columns=columns, show="headings")
             yscroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
             tree.configure(yscrollcommand=yscroll.set)
-            tree.pack(side="left", fill="both", expand=True)
-            yscroll.pack(side="right", fill="y")
+            tree.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
             for col, head, width in zip(columns, headings, widths):
                 tree.heading(col, text=head)
                 tree.column(col, width=width, stretch=True)
@@ -707,7 +744,7 @@ def run_gui(defaults: argparse.Namespace) -> int:
                 fg="white",
                 bg="#1B4F72",
                 font=("Helvetica", 12, "bold"),
-            ).pack(anchor="w", padx=16, pady=(12, 0))
+            ).pack(anchor="w", padx=16, pady=8)
             tk.Label(
                 toast,
                 text=message,
@@ -715,7 +752,7 @@ def run_gui(defaults: argparse.Namespace) -> int:
                 bg="#1B4F72",
                 font=("Helvetica", 10),
                 justify="left",
-            ).pack(anchor="w", padx=16, pady=(4, 14))
+            ).pack(anchor="w", padx=16, pady=8)
             toast.update_idletasks()
             width = max(toast.winfo_reqwidth(), 320)
             height = toast.winfo_reqheight()
@@ -761,9 +798,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--export-users")
     parser.add_argument("--export-logs")
     parser.add_argument("--live", action="store_true", help="Nhận chấm công realtime")
+    parser.add_argument("--web", action="store_true", help="Mở GUI web (khuyên dùng trên macOS)")
+    parser.add_argument("--tk", action="store_true", help="Mở GUI tkinter")
     args = parser.parse_args(argv)
     if args.export_users or args.export_logs or args.live:
         return run_cli(args)
+    if args.web or (sys.platform == "darwin" and not args.tk):
+        from web_gui import run_web
+
+        return run_web(args)
     return run_gui(args)
 
 
