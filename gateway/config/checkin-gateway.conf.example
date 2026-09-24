@@ -1,0 +1,22 @@
+# Checkin Gateway — Ronald Jack DG-600-ID → CommaDesk device-ingest
+# Copy to /etc/checkin-gateway/checkin-gateway.conf and edit.
+
+# LAN connectivity to attendance terminal (NOT CommaDesk authentication)
+device_ip=192.168.1.201
+device_port=4370
+device_password=0
+device_timeout_sec=10
+
+# CommaDesk API base (include /api/v1, no trailing slash)
+base_url=https://your-host.example.com/api/v1
+
+# Local state (credentials + outbox). Protect with filesystem permissions.
+data_dir=/var/lib/checkin-gateway
+
+agent_name=checkin-gateway
+agent_version=1.0.0
+
+live_listen=true
+reconnect_delay_sec=5
+outbox_retry_sec=15
+http_timeout_sec=30

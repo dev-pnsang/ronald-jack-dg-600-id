@@ -1,0 +1,21 @@
+[Unit]
+Description=CommaDesk Checkin Gateway (Ronald Jack DG-600-ID)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=checkin-gateway
+Group=checkin-gateway
+ExecStart=/usr/local/bin/checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf
+Restart=on-failure
+RestartSec=5
+# Secrets live under data_dir; do not expose in Environment=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/checkin-gateway
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

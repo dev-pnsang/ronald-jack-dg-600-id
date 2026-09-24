@@ -4,3 +4,9 @@ src/Dg600ReaderPy/.deps/
 __pycache__/
 *.pyc
 
+# Checkin gateway build artifacts / local secrets
+gateway/build/
+**/state.db
+*.db-wal
+*.db-shm
+
