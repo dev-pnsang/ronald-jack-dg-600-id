@@ -148,18 +148,28 @@ std::string CleanText(const std::string& s) {
   return Trim(out);
 }
 
-// Score a candidate name segment: prefer Latin letters (ASCII names on DG-600).
+// Score a candidate name segment for DG-600 USERTEMP fields.
+// Prefer pure ASCII letter names; treat high-bit tokens (e.g. d0 e7 4f) as garbage.
 int ScoreNameSegment(const std::string& s) {
   int letters = 0;
+  int digits = 0;
+  int high = 0;
   int other = 0;
   for (unsigned char c : s) {
     if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
       ++letters;
+    else if (c >= '0' && c <= '9')
+      ++digits;
+    else if (c >= 128)
+      ++high;
     else
       ++other;
   }
-  // Prefer letter-heavy segments (e.g. NguyenVanMinh over short binary token).
-  return letters * 100 + static_cast<int>(s.size()) - other * 5 - (letters == 0 ? 50 : 0);
+  if (high > 0) {
+    // Binary/GBK stub before NUL — never preferred over ASCII.
+    return -10000 - high * 10 + letters;
+  }
+  return letters * 100 + digits * 10 + static_cast<int>(s.size()) - other * 5;
 }
 
 // Extract best printable C-string inside a fixed field.
