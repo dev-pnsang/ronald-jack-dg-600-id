@@ -25,13 +25,20 @@ struct Config {
 
   // Behavior
   bool live_listen = true;
+  bool poll_fallback = true;       // also pull recent ATTLOG when live is quiet
+  int poll_interval_sec = 30;
+  bool ingest_minimal = false;     // only attendance_code + timestamp
   int reconnect_delay_sec = 5;
   int outbox_retry_sec = 15;
+  int outbox_max_attempts = 50;
+  int outbox_retention_days = 14;  // prune seen + dead outbox older than this
   int http_timeout_sec = 30;
 };
 
 // Load key=value config file. Missing keys keep defaults.
 // Returns false on I/O error (path set but unreadable).
 bool LoadConfig(const std::string& path, Config& out, std::string& err);
+
+bool ParseBool(const std::string& val, bool default_value = false);
 
 }  // namespace cg

@@ -6,13 +6,17 @@ namespace cg {
 
 std::string BuildIngestBody(const AttendanceEvent& ev, const DeviceInfo& device,
                             const Config& cfg) {
-  // Contract fields from device-ingest.md + all available punch/device extras.
-  // Server may ignore unknown fields; required identity field is always attendance_code.
   nlohmann::json j;
+  // Contract fields from device-ingest.md
   j["attendance_code"] = ev.user_id;
-  j["employee_code"] = ev.user_id;  // also send local ID; server resolve order handles both
   j["timestamp"] = ev.timestamp_iso;
 
+  if (cfg.ingest_minimal) {
+    return j.dump();
+  }
+
+  // Full payload: local ID also as employee_code + all available punch/device fields.
+  j["employee_code"] = ev.user_id;
   j["device_user_id"] = ev.user_id;
   if (!ev.user_name.empty()) j["user_name"] = ev.user_name;
   j["verify_mode"] = ev.verify_mode;
@@ -38,7 +42,6 @@ std::string BuildIngestBody(const AttendanceEvent& ev, const DeviceInfo& device,
       {"role", "checkin_gateway"},
   };
 
-  // Compact JSON — HMAC must cover exact bytes sent.
   return j.dump();
 }
 

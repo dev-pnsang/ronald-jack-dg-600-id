@@ -511,6 +511,117 @@ bool ZkDevice::ReadUsers(std::vector<UserRecord>& out, std::string& err) {
   return true;
 }
 
+bool ZkDevice::ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err) {
+  out.clear();
+  if (!connected_) {
+    err = "not connected";
+    return false;
+  }
+  // Temporarily stop live so ATTLOG_RRQ is not interleaved with events.
+  bool was_live = live_;
+  if (was_live) StopLiveCapture();
+
+  if (!EnableDevice(false, err)) {
+    if (was_live) StartLiveCapture(err);
+    return false;
+  }
+
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  bool ok = SendCommand(CMD_ATTLOG_RRQ, {}, reply, cmd, err, timeout_sec_ * 1000);
+  if (!ok) {
+    EnableDevice(true, err);
+    if (was_live) StartLiveCapture(err);
+    return false;
+  }
+
+  std::vector<uint8_t> blob;
+  if (cmd == CMD_PREPARE_DATA && reply.size() >= 4) {
+    uint32_t size = ReadU32(reply.data());
+    blob.reserve(size);
+    while (blob.size() < size) {
+      std::vector<uint8_t> chunk;
+      uint16_t c = 0;
+      if (!RecvPacket(chunk, c, err, timeout_sec_ * 1000)) {
+        EnableDevice(true, err);
+        if (was_live) StartLiveCapture(err);
+        return false;
+      }
+      if (c == CMD_DATA) {
+        blob.insert(blob.end(), chunk.begin(), chunk.end());
+      } else if (c == CMD_ACK_OK) {
+        break;
+      } else {
+        break;
+      }
+    }
+    std::vector<uint8_t> freply;
+    uint16_t fcmd = 0;
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, err, 3000);
+  } else if (cmd == CMD_DATA || cmd == CMD_ACK_OK) {
+    blob = reply;
+  }
+
+  EnableDevice(true, err);
+  if (was_live) {
+    std::string e2;
+    StartLiveCapture(e2);
+  }
+
+  // SSR attendance record: typically 40 bytes
+  // user_id[24] + time(u32) + status(u8) + punch(u8) + reserved...
+  const size_t rec = 40;
+  std::string received = UtcNowIso8601();
+  for (size_t off = 0; off + 16 <= blob.size();) {
+    size_t step = (off + rec <= blob.size()) ? rec : 16;
+    const uint8_t* p = blob.data() + off;
+    AttendanceEvent ev;
+    ev.from_live = false;
+    ev.received_at_iso = received;
+
+    char uidstr[28] = {};
+    std::memcpy(uidstr, p, 24);
+    ev.user_id = CleanText(uidstr);
+    size_t time_off = 24;
+    if (ev.user_id.empty()) {
+      // legacy: uid u16 at 0, time at 4
+      uint16_t uid = ReadU16(p);
+      if (uid == 0) {
+        off += step;
+        continue;
+      }
+      ev.user_id = std::to_string(uid);
+      time_off = 4;
+      step = 16;
+    }
+    if (time_off + 4 > blob.size() - off) break;
+    uint32_t t = ReadU32(p + time_off);
+    ev.second = static_cast<int>(t % 60);
+    ev.minute = static_cast<int>((t / 60) % 60);
+    ev.hour = static_cast<int>((t / 3600) % 24);
+    ev.day = static_cast<int>(((t / (3600 * 24)) % 31) + 1);
+    ev.month = static_cast<int>(((t / (3600 * 24 * 31)) % 12) + 1);
+    ev.year = static_cast<int>((t / (3600 * 24 * 31 * 12)) + 2000);
+    if (ev.year < 2000 || ev.year > 2099) {
+      off += step;
+      continue;
+    }
+    ev.timestamp_iso = FormatIso8601Utc(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second);
+    if (time_off + 4 < step) ev.verify_mode = p[time_off + 4];
+    if (time_off + 5 < step) ev.inout_mode = p[time_off + 5];
+    if (time_off + 6 < step) ev.work_code = p[time_off + 6];
+    for (const auto& u : users_cache_) {
+      if (u.user_id == ev.user_id) {
+        ev.user_name = u.name;
+        break;
+      }
+    }
+    if (!ev.user_id.empty() && ev.user_id != "0") out.push_back(ev);
+    off += step;
+  }
+  return true;
+}
+
 bool ZkDevice::StartLiveCapture(std::string& err) {
   if (!connected_) {
     err = "not connected";

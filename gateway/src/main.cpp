@@ -10,12 +10,16 @@ namespace {
 void Usage(const char* argv0) {
   std::fprintf(stderr,
                "Usage:\n"
-               "  %s --config <path>                 Run checkin gateway service\n"
-               "  %s --config <path> --enroll <code> Enroll Device Identity (pairing code)\n"
+               "  %s --config <path>\n"
+               "      Run checkin gateway service (live listen + ingest)\n"
+               "  %s --config <path> --enroll <pairing_code>\n"
+               "      Enroll Device Identity once; store secrets in data_dir\n"
+               "  %s --config <path> --ack-rotate <secrets.json>\n"
+               "      After admin Rotate: ACK with new secrets and replace local store\n"
                "\n"
-               "Config keys: device_ip, device_port, base_url, data_dir, ...\n"
-               "See config/checkin-gateway.conf.example\n",
-               argv0, argv0);
+               "secrets.json: {\"auth_secret\":\"cp_dev_...\",\"signing_secret\":\"cp_dsig_...\"}\n"
+               "Config example: config/checkin-gateway.conf.example\n",
+               argv0, argv0, argv0);
 }
 
 }  // namespace
@@ -23,7 +27,9 @@ void Usage(const char* argv0) {
 int main(int argc, char** argv) {
   std::string config_path;
   std::string pairing_code;
+  std::string rotate_path;
   bool enroll = false;
+  bool ack_rotate = false;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -31,6 +37,9 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--enroll") == 0 && i + 1 < argc) {
       enroll = true;
       pairing_code = argv[++i];
+    } else if (std::strcmp(argv[i], "--ack-rotate") == 0 && i + 1 < argc) {
+      ack_rotate = true;
+      rotate_path = argv[++i];
     } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
       Usage(argv[0]);
       return 0;
@@ -43,6 +52,10 @@ int main(int argc, char** argv) {
 
   if (config_path.empty()) {
     Usage(argv[0]);
+    return 1;
+  }
+  if (enroll && ack_rotate) {
+    std::fprintf(stderr, "Use either --enroll or --ack-rotate, not both\n");
     return 1;
   }
 
@@ -59,6 +72,9 @@ int main(int argc, char** argv) {
       return 1;
     }
     return cg::RunEnroll(cfg, pairing_code);
+  }
+  if (ack_rotate) {
+    return cg::RunAckRotate(cfg, rotate_path);
   }
   return cg::RunGateway(cfg);
 }

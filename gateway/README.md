@@ -4,6 +4,8 @@ Linux background agent: listen attendance punches from **Ronald Jack DG-600-ID**
 
 Platform device role: **checkin gateway** (`device_type = gateway`). Agent does **not** set scopes — admin grants **GET / POST / PUT** on the CommaDesk Device Identity.
 
+Next-step plan: [`docs/checkin-gateway-next-plan.md`](../docs/checkin-gateway-next-plan.md)
+
 ## Source of truth
 
 - `requirements/api-may-cham-cong-device-ingest.md`
@@ -20,7 +22,7 @@ This agent reuses the **same wire protocol / field model** as the Standalone SDK
 |-------------------|---------|
 | `Connect_Net(ip, port)` | ZK TCP connect |
 | `RegEvent(..., 65535)` + RT events | `StartLiveCapture` + `PollLive` |
-| `SSR_GetGeneralLogData` fields | `user_id`, verify, inout, work_code, timestamp |
+| `SSR_GetGeneralLogData` / ATTLOG | `ReadAttendanceLogs` (poll fallback) |
 | IP/port | Config only (LAN connectivity — **not** CommaDesk AuthN) |
 
 ## Build
@@ -38,6 +40,8 @@ cp gateway/config/checkin-gateway.conf.example /etc/checkin-gateway/checkin-gate
 # set device_ip, device_port, base_url
 ```
 
+Useful keys: `ingest_minimal`, `poll_fallback`, `outbox_max_attempts`, `outbox_retention_days`.
+
 ## Enroll (once)
 
 1. Admin creates Device Identity type **Gateway**, methods **GET, POST, PUT**, then **Pairing**.
@@ -47,7 +51,21 @@ cp gateway/config/checkin-gateway.conf.example /etc/checkin-gateway/checkin-gate
 checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --enroll 'cp_pair_....'
 ```
 
-Secrets are stored in `$data_dir/state.db` — do not commit or log them.
+Secrets are stored in `$data_dir/state.db` (mode `0600`) — do not commit or log them.
+
+## Rotate + ACK
+
+After admin **Rotate** on CommaDesk, write new secrets to a temp JSON file (delete after):
+
+```json
+{"auth_secret":"cp_dev_...","signing_secret":"cp_dsig_..."}
+```
+
+```bash
+checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf \
+  --ack-rotate /tmp/new-secrets.json
+shred -u /tmp/new-secrets.json   # or rm
+```
 
 ## Run as systemd service
 
@@ -59,13 +77,13 @@ journalctl -u checkin-gateway -f
 
 ## Ingest payload
 
-Each live punch sends compact JSON including contract fields plus extras for server-side mapping:
+Default (`ingest_minimal=false`): contract fields + extras for server-side mapping:
 
 - `attendance_code` / `employee_code` = local machine user ID  
 - `timestamp` = device punch time (ISO-8601 `Z`)  
 - `verify_mode`, `inout_mode`, `work_code`, `user_name`, device serial/firmware, agent metadata  
 
-If the current server rejects unknown fields, trim extras server-side or tell us to send a minimal body.
+If server returns `INVALID_BODY`, the agent retries that punch with minimal `{attendance_code,timestamp}` once. Set `ingest_minimal=true` to always send minimal.
 
 ## Auth rules (unchanged)
 

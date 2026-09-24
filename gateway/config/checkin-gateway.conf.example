@@ -17,6 +17,15 @@ agent_name=checkin-gateway
 agent_version=1.0.0
 
 live_listen=true
+# Also pull ATTLOG periodically (covers missed live events after reconnect)
+poll_fallback=true
+poll_interval_sec=30
+
+# false = send local ID + all available fields; true = only attendance_code + timestamp
+ingest_minimal=false
+
 reconnect_delay_sec=5
 outbox_retry_sec=15
+outbox_max_attempts=50
+outbox_retention_days=14
 http_timeout_sec=30

@@ -1,11 +1,18 @@
 #include "config.hpp"
 
 #include <fstream>
-#include <sstream>
 
 #include "util.hpp"
 
 namespace cg {
+
+bool ParseBool(const std::string& val, bool default_value) {
+  auto v = ToLower(Trim(val));
+  if (v.empty()) return default_value;
+  if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+  if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+  return default_value;
+}
 
 bool LoadConfig(const std::string& path, Config& out, std::string& err) {
   if (path.empty()) {
@@ -19,9 +26,7 @@ bool LoadConfig(const std::string& path, Config& out, std::string& err) {
   }
   out.config_path = path;
   std::string line;
-  int lineno = 0;
   while (std::getline(in, line)) {
-    ++lineno;
     line = Trim(line);
     if (line.empty() || line[0] == '#' || line[0] == ';') continue;
     auto eq = line.find('=');
@@ -32,22 +37,30 @@ bool LoadConfig(const std::string& path, Config& out, std::string& err) {
                          (val.front() == '\'' && val.back() == '\''))) {
       val = val.substr(1, val.size() - 2);
     }
-    if (key == "device_ip") out.device_ip = val;
-    else if (key == "device_port") out.device_port = std::stoi(val);
-    else if (key == "device_password") out.device_password = std::stoi(val);
-    else if (key == "device_timeout_sec") out.device_timeout_sec = std::stoi(val);
-    else if (key == "base_url") {
-      while (!val.empty() && val.back() == '/') val.pop_back();
-      out.base_url = val;
-    } else if (key == "data_dir") out.data_dir = val;
-    else if (key == "agent_name") out.agent_name = val;
-    else if (key == "agent_version") out.agent_version = val;
-    else if (key == "live_listen") {
-      auto v = ToLower(val);
-      out.live_listen = !(v == "0" || v == "false" || v == "no" || v == "off");
-    } else if (key == "reconnect_delay_sec") out.reconnect_delay_sec = std::stoi(val);
-    else if (key == "outbox_retry_sec") out.outbox_retry_sec = std::stoi(val);
-    else if (key == "http_timeout_sec") out.http_timeout_sec = std::stoi(val);
+    try {
+      if (key == "device_ip") out.device_ip = val;
+      else if (key == "device_port") out.device_port = std::stoi(val);
+      else if (key == "device_password") out.device_password = std::stoi(val);
+      else if (key == "device_timeout_sec") out.device_timeout_sec = std::stoi(val);
+      else if (key == "base_url") {
+        while (!val.empty() && val.back() == '/') val.pop_back();
+        out.base_url = val;
+      } else if (key == "data_dir") out.data_dir = val;
+      else if (key == "agent_name") out.agent_name = val;
+      else if (key == "agent_version") out.agent_version = val;
+      else if (key == "live_listen") out.live_listen = ParseBool(val, true);
+      else if (key == "poll_fallback") out.poll_fallback = ParseBool(val, true);
+      else if (key == "poll_interval_sec") out.poll_interval_sec = std::stoi(val);
+      else if (key == "ingest_minimal") out.ingest_minimal = ParseBool(val, false);
+      else if (key == "reconnect_delay_sec") out.reconnect_delay_sec = std::stoi(val);
+      else if (key == "outbox_retry_sec") out.outbox_retry_sec = std::stoi(val);
+      else if (key == "outbox_max_attempts") out.outbox_max_attempts = std::stoi(val);
+      else if (key == "outbox_retention_days") out.outbox_retention_days = std::stoi(val);
+      else if (key == "http_timeout_sec") out.http_timeout_sec = std::stoi(val);
+    } catch (const std::exception& ex) {
+      err = "bad config value for " + key + ": " + ex.what();
+      return false;
+    }
   }
   return true;
 }

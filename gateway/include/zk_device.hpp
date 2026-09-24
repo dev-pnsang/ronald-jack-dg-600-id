@@ -57,6 +57,9 @@ class ZkDevice {
   bool ReadDeviceInfo(DeviceInfo& out, std::string& err);
   bool ReadUsers(std::vector<UserRecord>& out, std::string& err);
 
+  // Pull attendance logs from device (CMD_ATTLOG_RRQ) — used as poll fallback.
+  bool ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err);
+
   // Register for realtime attendance events (RegEvent / live capture).
   bool StartLiveCapture(std::string& err);
   void StopLiveCapture();

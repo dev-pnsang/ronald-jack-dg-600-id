@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,12 +32,22 @@ class Store {
 
   bool Enqueue(const std::string& dedupe_key, const std::string& body_json, std::string& err);
   bool SeenDedupe(const std::string& dedupe_key);
-  std::vector<OutboxItem> DueOutbox(int limit, int64_t now);
+  // Only rows with attempts < max_attempts and next_attempt_at <= now.
+  std::vector<OutboxItem> DueOutbox(int limit, int64_t now, int max_attempts);
   bool MarkOutboxOk(int64_t id, std::string& err);
   bool MarkOutboxFail(int64_t id, const std::string& error, int64_t next_attempt_at, std::string& err);
+  // Move exhausted retries out of active outbox (keep dedupe in seen).
+  bool AbandonOutbox(int64_t id, const std::string& error, std::string& err);
+
+  // Delete seen rows and abandoned outbox older than cutoff (unix seconds).
+  int Prune(int64_t older_than_unix, std::string& err);
+
+  bool SetMeta(const std::string& key, const std::string& value, std::string& err);
+  bool GetMeta(const std::string& key, std::string& value, std::string& err);
 
  private:
   void* db_ = nullptr;  // sqlite3*
+  std::string db_path_;
 };
 
 }  // namespace cg
