@@ -70,6 +70,109 @@ std::string FingerprintEvents(const std::vector<AttendanceEvent>& logs) {
   return std::to_string(keys.size()) + ":" + std::to_string(h);
 }
 
+std::string FingerprintUsers(const std::vector<UserRecord>& users) {
+  std::vector<std::string> keys;
+  keys.reserve(users.size());
+  for (const auto& u : users) {
+    keys.push_back(u.user_id + "|" + u.name + "|" + std::to_string(u.privilege) + "|" +
+                    (u.enabled ? "1" : "0"));
+  }
+  std::sort(keys.begin(), keys.end());
+  uint64_t h = 5381;
+  for (const auto& k : keys) {
+    for (unsigned char c : k) h = ((h << 5) + h) + c;
+  }
+  return std::to_string(keys.size()) + ":" + std::to_string(h);
+}
+
+std::string SanitizeUtf8Users(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+  size_t i = 0, n = s.size();
+  while (i < n) {
+    unsigned char c = p[i];
+    if (c <= 0x7F) {
+      out.push_back(static_cast<char>(c));
+      ++i;
+      continue;
+    }
+    size_t need = 0;
+    if ((c & 0xE0) == 0xC0)
+      need = 2;
+    else if ((c & 0xF0) == 0xE0)
+      need = 3;
+    else if ((c & 0xF8) == 0xF0)
+      need = 4;
+    else {
+      out.push_back('?');
+      ++i;
+      continue;
+    }
+    if (i + need > n) {
+      out.push_back('?');
+      ++i;
+      continue;
+    }
+    bool ok = true;
+    for (size_t j = 1; j < need; ++j) {
+      if ((p[i + j] & 0xC0) != 0x80) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) {
+      out.push_back('?');
+      ++i;
+      continue;
+    }
+    out.append(s, i, need);
+    i += need;
+  }
+  return out;
+}
+
+void SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
+                             const std::string& terminal_id, const std::string& terminal_ip,
+                             const std::vector<UserRecord>& users) {
+  if (users.empty()) {
+    std::fprintf(stderr, "[users] %s empty catalog (skip)\n", terminal_ip.c_str());
+    return;
+  }
+  std::string fp = FingerprintUsers(users);
+  std::string fp_key = "users_fp:" + (terminal_id.empty() ? terminal_ip : terminal_id);
+  std::string prev_fp;
+  std::string meta_err;
+  store.GetMeta(fp_key, prev_fp, meta_err);
+  if (!prev_fp.empty() && prev_fp == fp) {
+    std::fprintf(stderr, "[users] %s unchanged fp=%s (skip PUT)\n", terminal_ip.c_str(), fp.c_str());
+    return;
+  }
+  nlohmann::json body;
+  body["terminal_ip"] = terminal_ip;
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& u : users) {
+    if (u.user_id.empty()) continue;
+    nlohmann::json row;
+    row["user_id"] = SanitizeUtf8Users(u.user_id);
+    if (!u.name.empty()) row["name"] = SanitizeUtf8Users(u.name);
+    row["privilege"] = u.privilege;
+    row["enabled"] = u.enabled;
+    arr.push_back(std::move(row));
+  }
+  body["users"] = std::move(arr);
+  auto r = SignedRequest(cfg, http, cred, "PUT", "/checkin/machine-users", body.dump());
+  if (!r.ok) {
+    std::fprintf(stderr, "[users] PUT fail %s: %s %s\n", terminal_ip.c_str(), r.error.c_str(),
+                 r.body.substr(0, 200).c_str());
+    return;
+  }
+  store.SetMeta(fp_key, fp, meta_err);
+  std::fprintf(stderr, "[users] synced %zu from %s fp=%s\n", users.size(), terminal_ip.c_str(),
+               fp.c_str());
+}
+
+
 // Fire only in the first 90 seconds of local 00:00 and 12:00 (once per slot key).
 std::string CurrentAttlogSyncSlot() {
   std::time_t now = std::time(nullptr);
@@ -438,10 +541,17 @@ int RunGateway(const Config& cfg_in) {
     std::vector<AttendanceEvent> logs;
     if (!device.ReadAttendanceLogs(logs, local_err)) {
       std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(), local_err.c_str());
-      device.Disconnect();
-      return;
+      // Still try ReadUsers in same session if ATTLOG failed mid-way.
+    }
+    std::vector<UserRecord> users;
+    if (!device.ReadUsers(users, local_err)) {
+      std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+      users.clear();
     }
     device.Disconnect();
+
+    // Push USERTEMP catalog (independent of ATTLOG fingerprint skip).
+    SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
 
     std::string since = t.usage_started_on;
     if (since.empty()) {
