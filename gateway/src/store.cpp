@@ -7,6 +7,14 @@
 #include "util.hpp"
 
 namespace cg {
+namespace {
+
+std::string ColText(sqlite3_stmt* st, int col) {
+  const unsigned char* p = sqlite3_column_text(st, col);
+  return p ? reinterpret_cast<const char*>(p) : "";
+}
+
+}  // namespace
 
 Store::~Store() { Close(); }
 
@@ -100,12 +108,12 @@ bool Store::LoadCredential(Credential& out, std::string& err) {
   }
   bool ok = false;
   if (sqlite3_step(st) == SQLITE_ROW) {
-    out.device_id = reinterpret_cast<const char*>(sqlite3_column_text(st, 0) ?: "");
-    out.organization_id = reinterpret_cast<const char*>(sqlite3_column_text(st, 1) ?: "");
-    out.auth_secret = reinterpret_cast<const char*>(sqlite3_column_text(st, 2) ?: "");
-    out.signing_secret = reinterpret_cast<const char*>(sqlite3_column_text(st, 3) ?: "");
-    out.credential_id = reinterpret_cast<const char*>(sqlite3_column_text(st, 4) ?: "");
-    out.scopes_json = reinterpret_cast<const char*>(sqlite3_column_text(st, 5) ?: "");
+    out.device_id = ColText(st, 0);
+    out.organization_id = ColText(st, 1);
+    out.auth_secret = ColText(st, 2);
+    out.signing_secret = ColText(st, 3);
+    out.credential_id = ColText(st, 4);
+    out.scopes_json = ColText(st, 5);
     ok = !out.auth_secret.empty() && !out.signing_secret.empty();
     if (!ok) err = "credential row incomplete";
   } else {
@@ -168,7 +176,7 @@ std::vector<OutboxItem> Store::DueOutbox(int limit, int64_t now) {
     it.dedupe_key = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
     it.body_json = reinterpret_cast<const char*>(sqlite3_column_text(st, 2));
     it.attempts = sqlite3_column_int(st, 3);
-    it.last_error = reinterpret_cast<const char*>(sqlite3_column_text(st, 4) ?: "");
+    it.last_error = ColText(st, 4);
     it.created_at = sqlite3_column_int64(st, 5);
     it.next_attempt_at = sqlite3_column_int64(st, 6);
     items.push_back(std::move(it));
