@@ -31,13 +31,19 @@ constexpr uint16_t CMD_ACK_UNAUTH = 2005;
 constexpr uint16_t CMD_PREPARE_DATA = 1500;
 constexpr uint16_t CMD_DATA = 1501;
 constexpr uint16_t CMD_FREE_DATA = 1502;
+constexpr uint16_t CMD_PREPARE_BUFFER = 1503;  // pyzk read_with_buffer
+constexpr uint16_t CMD_READ_BUFFER = 1504;
 constexpr uint16_t CMD_USERTEMP_RRQ = 9;
 constexpr uint16_t CMD_ATTLOG_RRQ = 13;
+constexpr uint16_t CMD_CLEAR_ATTLOG = 15;
 constexpr uint16_t CMD_DEVICE = 11;
 constexpr uint16_t CMD_GET_TIME = 201;
 constexpr uint16_t CMD_SET_TIME = 202;
 constexpr uint16_t CMD_GET_FREE_SIZES = 50;
+constexpr uint16_t CMD_REFRESHDATA = 1013;
 constexpr uint16_t CMD_REG_EVENT = 500;
+constexpr int32_t FCT_USER = 5;
+constexpr uint32_t BUF_MAX_CHUNK = 0xFFc0;  // ~64KiB TCP chunk (pyzk)
 constexpr uint16_t EF_ATTLOG = 1;
 
 uint16_t ReadU16(const uint8_t* p) {
@@ -448,6 +454,58 @@ bool ZkDevice::EnableDevice(bool enable, std::string& err) {
   return SendCommand(enable ? CMD_ENABLEDEVICE : CMD_DISABLEDEVICE, {}, reply, cmd, err);
 }
 
+bool ZkDevice::RecoverDevice(std::string& err) {
+  for (int i = 0; i < 3; ++i) {
+    std::string e;
+    if (EnableDevice(true, e)) {
+      err.clear();
+      return true;
+    }
+    err = e;
+    LogWarning("EnableDevice retry " + std::to_string(i + 1) + ": " + e);
+    ::usleep(200000u * static_cast<unsigned>(i + 1));
+  }
+  const std::string ip = ip_;
+  const int port = port_;
+  const int pw = password_;
+  const int to = timeout_sec_;
+  LogWarning("RecoverDevice: hard reconnect " + ip + ":" + std::to_string(port));
+  Disconnect();
+  std::string e2;
+  if (!Connect(ip, port, pw, to, e2)) {
+    err = "reconnect after bulk failed: " + e2;
+    return false;
+  }
+  if (!EnableDevice(true, e2)) {
+    err = "enable after reconnect failed: " + e2;
+    return false;
+  }
+  err.clear();
+  return true;
+}
+
+bool ZkDevice::ClearAttendanceLogs(std::string& err) {
+  if (!connected_) {
+    err = "not connected";
+    return false;
+  }
+  // pyzk clear_attendance sends CMD_CLEAR_ATTLOG without DisableDevice.
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  bool ok = SendCommand(CMD_CLEAR_ATTLOG, {}, reply, cmd, err, 10000);
+  if (ok) {
+    std::string e_ref;
+    uint16_t rcmd = 0;
+    SendCommand(CMD_REFRESHDATA, {}, reply, rcmd, e_ref, 5000);
+    LogInfo("ClearAttendanceLogs ok");
+  } else {
+    LogWarning("ClearAttendanceLogs failed: " + err);
+  }
+  std::string e_rec;
+  RecoverDevice(e_rec);
+  return ok;
+}
+
 bool ZkDevice::GetString(uint16_t /*command*/, const std::string& param, std::string& value,
                          std::string& err) {
   auto r = ProbeOption(param);
@@ -683,11 +741,7 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
   raw = RawBlob{};
   raw.label = "cmd_" + std::to_string(command);
   const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 120000);
-  if (!EnableDevice(false, err)) {
-    raw.status = "FAILED";
-    raw.error = std::string("disable before bulk: ") + err;
-    return false;
-  }
+  // No DisableDevice — same rationale as FetchLargeDataBuffered / pyzk.
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
   LogInfo("Bulk request cmd=" + std::to_string(command) + " timeout_ms=" +
@@ -697,7 +751,8 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
     raw.status = "FAILED";
     raw.error = err;
     raw.reply_cmd = cmd;
-    EnableDevice(true, err);
+    std::string e_rec;
+    RecoverDevice(e_rec);
     return false;
   }
   raw.reply_cmd = cmd;
@@ -713,7 +768,8 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
         raw.status = "FAILED";
         raw.error = err + " (got " + std::to_string(blob.size()) + "/" + std::to_string(size) + ")";
         raw.bytes = blob;
-        EnableDevice(true, err);
+        std::string e_rec;
+        RecoverDevice(e_rec);
         return false;
       }
       if (c == CMD_DATA) {
@@ -739,13 +795,13 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
     raw.error = "unexpected reply_cmd=" + std::to_string(cmd);
     raw.bytes = reply;
     std::string e2;
-    EnableDevice(true, e2);
+    RecoverDevice(e2);
     return false;
   }
   {
     std::string e_en;
-    if (!EnableDevice(true, e_en)) {
-      LogWarning("EnableDevice after bulk failed: " + e_en);
+    if (!RecoverDevice(e_en)) {
+      LogWarning("RecoverDevice after bulk failed: " + e_en);
     }
   }
   raw.bytes = std::move(blob);
@@ -754,6 +810,133 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
   return true;
 }
 
+
+bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
+                                      std::string& err) {
+  raw = RawBlob{};
+  raw.label = "buf_cmd_" + std::to_string(command);
+  const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 180000);
+  // IMPORTANT: Do NOT DisableDevice here.
+  // Dg600ReaderPy/pyzk read_with_buffer pulls USERTEMP/ATTLOG without disabling;
+  // DisableDevice is what freezes the panel on "Đang xử lý" when Enable fails after bulk.
+
+  // pyzk: pack('<bhii', 1, command, fct, ext)
+  std::vector<uint8_t> prep;
+  prep.push_back(1);
+  WriteU16(prep, command);
+  auto write_i32 = [](std::vector<uint8_t>& b, int32_t v) {
+    uint32_t u = static_cast<uint32_t>(v);
+    WriteU32(b, u);
+  };
+  write_i32(prep, fct);
+  write_i32(prep, ext);
+
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  // Short prepare timeout: if firmware lacks 1503 or hangs, fall back to stream quickly.
+  const int prepare_timeout_ms = std::min(bulk_timeout_ms, 20000);
+  LogInfo("Buffered prepare cmd=" + std::to_string(command) + " fct=" + std::to_string(fct) +
+          " prepare_timeout_ms=" + std::to_string(prepare_timeout_ms));
+  if (!SendCommand(CMD_PREPARE_BUFFER, prep, reply, cmd, err, prepare_timeout_ms)) {
+    raw.status = "FAILED";
+    raw.error = err;
+    raw.reply_cmd = cmd;
+    std::string e_rec;
+    RecoverDevice(e_rec);
+    return false;
+  }
+  raw.reply_cmd = cmd;
+  std::vector<uint8_t> blob;
+
+  if (cmd == CMD_DATA) {
+    blob = std::move(reply);
+  } else {
+    // pyzk: size = unpack('I', data[1:5])
+    if (reply.size() < 5) {
+      raw.status = "FAILED";
+      raw.error = "PREPARE_BUFFER short reply len=" + std::to_string(reply.size());
+      std::string e_rec;
+      RecoverDevice(e_rec);
+      return false;
+    }
+    uint32_t size = ReadU32(reply.data() + 1);
+    LogInfo("PREPARE_BUFFER size=" + std::to_string(size));
+    if (size == 0) {
+      blob.clear();
+    } else if (size > 64u * 1024u * 1024u) {
+      raw.status = "FAILED";
+      raw.error = "PREPARE_BUFFER size too large: " + std::to_string(size);
+      std::string e_rec;
+      RecoverDevice(e_rec);
+      return false;
+    } else {
+      blob.reserve(size);
+      uint32_t start = 0;
+      while (start < size) {
+        uint32_t need = size - start;
+        if (need > BUF_MAX_CHUNK) need = BUF_MAX_CHUNK;
+        std::vector<uint8_t> req;
+        WriteU32(req, start);
+        WriteU32(req, need);
+        bool got = false;
+        std::string last_err;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+          std::vector<uint8_t> creply;
+          uint16_t ccmd = 0;
+          if (!SendCommand(CMD_READ_BUFFER, req, creply, ccmd, last_err, bulk_timeout_ms)) {
+            continue;
+          }
+          if (ccmd == CMD_DATA || ccmd == CMD_ACK_OK || ccmd == CMD_ACK_DATA) {
+            blob.insert(blob.end(), creply.begin(), creply.end());
+            got = true;
+            break;
+          }
+          last_err = "READ_BUFFER unexpected cmd=" + std::to_string(ccmd);
+        }
+        if (!got) {
+          raw.status = "FAILED";
+          raw.error = last_err + " at offset " + std::to_string(start);
+          raw.bytes = blob;
+          std::string e_rec;
+          RecoverDevice(e_rec);
+          return false;
+        }
+        start += need;
+        if (start == need || start % (BUF_MAX_CHUNK * 2) < need) {
+          LogInfo("buffer progress " + std::to_string(blob.size()) + "/" + std::to_string(size));
+        }
+      }
+    }
+    std::vector<uint8_t> freply;
+    uint16_t fcmd = 0;
+    std::string e_free;
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 5000);
+  }
+
+  {
+    std::string e_rec;
+    if (!RecoverDevice(e_rec)) {
+      LogWarning("RecoverDevice after buffer failed: " + e_rec);
+    }
+  }
+  raw.bytes = std::move(blob);
+  raw.status = raw.bytes.empty() ? "empty" : "ok";
+  LogInfo("Buffered done cmd=" + std::to_string(command) + " bytes=" +
+          std::to_string(raw.bytes.size()));
+  return true;
+}
+
+bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,
+                                   RawBlob& raw, std::string& err) {
+  std::string buf_err;
+  if (FetchLargeDataBuffered(command, fct, 0, raw, buf_err)) {
+    return true;
+  }
+  LogWarning("buffered read failed, fallback stream: " + buf_err);
+  return FetchLargeData(command, legacy_req, raw, err);
+}
+
+
 bool ZkDevice::ReadUsersRaw(std::vector<UserRecord>& out, RawBlob& raw, std::string& err) {
   out.clear();
   if (!connected_) {
@@ -761,11 +944,22 @@ bool ZkDevice::ReadUsersRaw(std::vector<UserRecord>& out, RawBlob& raw, std::str
     return false;
   }
   std::vector<uint8_t> data = {0x05};
-  if (!FetchLargeData(CMD_USERTEMP_RRQ, data, raw, err)) return false;
+  if (!FetchLargeDataSmart(CMD_USERTEMP_RRQ, FCT_USER, data, raw, err)) return false;
   raw.label = "CMD_USERTEMP_RRQ_users";
 
+  // Buffered path may prefix a u32 total size (pyzk); stream path is raw 72-byte records.
+  size_t base = 0;
+  if (raw.bytes.size() >= 4) {
+    uint32_t maybe = ReadU32(raw.bytes.data());
+    if (maybe > 0 && maybe + 4 == raw.bytes.size()) {
+      base = 4;
+    } else if ((raw.bytes.size() % 72) != 0 && ((raw.bytes.size() - 4) % 72) == 0) {
+      base = 4;
+    }
+  }
+
   const size_t rec = 72;
-  for (size_t off = 0; off + rec <= raw.bytes.size(); off += rec) {
+  for (size_t off = base; off + rec <= raw.bytes.size(); off += rec) {
     const uint8_t* p = raw.bytes.data() + off;
     UserRecord u;
     u.uid = ReadU16(p);
@@ -801,7 +995,7 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
   bool was_live = live_;
   if (was_live) StopLiveCapture();
 
-  if (!FetchLargeData(CMD_ATTLOG_RRQ, {}, raw, err)) {
+  if (!FetchLargeDataSmart(CMD_ATTLOG_RRQ, 0, {}, raw, err)) {
     if (was_live) {
       std::string e2;
       StartLiveCapture(e2);
@@ -809,6 +1003,13 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
     return false;
   }
   raw.label = "CMD_ATTLOG_RRQ";
+  // Some buffered firmwares prefix attlog with u32 size.
+  if (raw.bytes.size() >= 4) {
+    uint32_t maybe = ReadU32(raw.bytes.data());
+    if (maybe > 0 && maybe + 4 == raw.bytes.size()) {
+      raw.bytes.erase(raw.bytes.begin(), raw.bytes.begin() + 4);
+    }
+  }
 
   if (was_live) {
     std::string e2;

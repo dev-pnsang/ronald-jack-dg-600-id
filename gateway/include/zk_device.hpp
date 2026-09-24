@@ -98,6 +98,11 @@ class ZkDevice {
   bool ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err);
   bool ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob& raw, std::string& err);
 
+  // Re-enable UI after bulk (retry Enable, then hard reconnect). Call after every large pull.
+  bool RecoverDevice(std::string& err);
+  // Clear attendance buffer on device after successful local enqueue (keeps next pull small).
+  bool ClearAttendanceLogs(std::string& err);
+
   bool GetTime(DeviceTime& out, std::string& err);
   // Set device clock from local wall-clock components (year>=2000).
   bool SetTime(int year, int month, int day, int hour, int minute, int second, std::string& err);
@@ -133,6 +138,11 @@ class ZkDevice {
   bool ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& ev);
   bool FetchLargeData(uint16_t command, const std::vector<uint8_t>& req, RawBlob& raw,
                       std::string& err);
+  // pyzk-style buffered pull (CMD_PREPARE_BUFFER / CMD_READ_BUFFER).
+  bool FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
+                              std::string& err);
+  bool FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,
+                           RawBlob& raw, std::string& err);
 
   int tz_offset_min_ = 420;
   int fd_ = -1;

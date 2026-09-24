@@ -524,34 +524,91 @@ int RunGateway(const Config& cfg_in) {
   // Never sync on startup — only at local 00:00 and 12:00.
 
   auto sync_terminal_attlog = [&](const TerminalTarget& t) {
-    ZkDevice device;
     DeviceInfo info;
     info.ip = t.ip;
     info.port = t.port;
-    device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
     std::string local_err;
+    const std::string tid = t.id.empty() ? t.ip : t.id;
     std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s\n", t.name.c_str(), t.id.c_str(),
                  t.ip.c_str(), t.port,
                  t.usage_started_on.empty() ? "(today/all)" : t.usage_started_on.c_str());
-    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
-      std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
-      return;
-    }
-    device.ReadDeviceInfo(info, local_err);
-    std::vector<AttendanceEvent> logs;
-    if (!device.ReadAttendanceLogs(logs, local_err)) {
-      std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(), local_err.c_str());
-      // Still try ReadUsers in same session if ATTLOG failed mid-way.
-    }
-    std::vector<UserRecord> users;
-    if (!device.ReadUsers(users, local_err)) {
-      std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
-      users.clear();
-    }
-    device.Disconnect();
 
-    // Push USERTEMP catalog (independent of ATTLOG fingerprint skip).
-    SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
+    // --- Session A: ATTLOG only (buffered) ---
+    std::vector<AttendanceEvent> logs;
+    bool attlog_ok = false;
+    {
+      ZkDevice device;
+      device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+        std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+      } else {
+        device.ReadDeviceInfo(info, local_err);
+        if (!device.ReadAttendanceLogs(logs, local_err)) {
+          std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(), local_err.c_str());
+        } else {
+          attlog_ok = true;
+        }
+        std::string e_rec;
+        device.RecoverDevice(e_rec);
+        device.Disconnect();
+      }
+    }
+
+    // --- Session B: USERTEMP only when free-sizes user count changed ---
+    {
+      bool need_users = true;
+      int user_count = -1;
+      {
+        ZkDevice probe;
+        probe.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+        if (probe.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+          DeviceInfo sizes_info;
+          RawBlob sizes_raw;
+          if (probe.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
+            user_count = sizes_info.user_count;
+            std::string count_key = "users_count:" + tid;
+            std::string prev_count;
+            std::string meta_err;
+            store.GetMeta(count_key, prev_count, meta_err);
+            if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
+              // Count unchanged — still allow full re-sync if users_fp missing (first run).
+              std::string fp_key = "users_fp:" + tid;
+              std::string prev_fp;
+              store.GetMeta(fp_key, prev_fp, meta_err);
+              if (!prev_fp.empty()) {
+                need_users = false;
+                std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n", t.ip.c_str(),
+                             user_count);
+              }
+            }
+          }
+          std::string e_rec;
+          probe.RecoverDevice(e_rec);
+          probe.Disconnect();
+        }
+      }
+
+      if (need_users) {
+        ZkDevice device;
+        device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+        std::vector<UserRecord> users;
+        if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+          std::fprintf(stderr, "[users] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+        } else {
+          if (!device.ReadUsers(users, local_err)) {
+            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+            users.clear();
+          }
+          std::string e_rec;
+          device.RecoverDevice(e_rec);
+          device.Disconnect();
+          SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
+          if (user_count < 0) user_count = static_cast<int>(users.size());
+          std::string meta_err;
+          store.SetMeta("users_count:" + tid, std::to_string(user_count), meta_err);
+        }
+      }
+    }
 
     std::string since = t.usage_started_on;
     if (since.empty()) {
@@ -573,7 +630,7 @@ int RunGateway(const Config& cfg_in) {
     }
 
     std::string fp = FingerprintEvents(filtered);
-    std::string fp_key = "attlog_fp:" + (t.id.empty() ? t.ip : t.id);
+    std::string fp_key = "attlog_fp:" + tid;
     std::string prev_fp;
     std::string meta_err;
     store.GetMeta(fp_key, prev_fp, meta_err);
@@ -591,6 +648,27 @@ int RunGateway(const Config& cfg_in) {
     store.SetMeta(fp_key, fp, meta_err);
     std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d fp=%s\n", t.ip.c_str(),
                  filtered.size(), logs.size(), enq, fp.c_str());
+
+    // Flush outbox before clearing device buffer so punches are durable locally.
+    FlushOutbox(cfg, store, http, cred);
+
+    // Clear ATTLOG on device only after successful read + enqueue (keeps next slot fast).
+    if (attlog_ok) {
+      ZkDevice clearer;
+      clearer.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+      if (clearer.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+        if (clearer.ClearAttendanceLogs(local_err)) {
+          std::fprintf(stderr, "[attlog] %s cleared device ATTLOG after enqueue=%d\n", t.ip.c_str(),
+                       enq);
+          // Empty fingerprint so next slot does not re-ingest stale filtered set from empty machine
+          // incorrectly — empty pull fingerprints to empty and skips; OK.
+          store.SetMeta(fp_key, FingerprintEvents({}), meta_err);
+        } else {
+          std::fprintf(stderr, "[attlog] %s clear failed: %s\n", t.ip.c_str(), local_err.c_str());
+        }
+        clearer.Disconnect();
+      }
+    }
   };
 
   while (g_running) {
