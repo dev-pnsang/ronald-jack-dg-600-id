@@ -148,12 +148,45 @@ std::string CleanText(const std::string& s) {
   return Trim(out);
 }
 
-// Extract first printable C-string inside a fixed field (skip leading NULs).
+// Score a candidate name segment: prefer Latin letters (ASCII names on DG-600).
+int ScoreNameSegment(const std::string& s) {
+  int letters = 0;
+  int other = 0;
+  for (unsigned char c : s) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+      ++letters;
+    else
+      ++other;
+  }
+  // Prefer letter-heavy segments (e.g. NguyenVanMinh over short binary token).
+  return letters * 100 + static_cast<int>(s.size()) - other * 5 - (letters == 0 ? 50 : 0);
+}
+
+// Extract best printable C-string inside a fixed field.
+// DG-600 USERTEMP name field often packs a short token + NUL + ASCII name.
+// Stopping at the first NUL (old behavior) yields only the token, which becomes
+// "??O" after UTF-8 sanitize on the gateway/server path.
 std::string CleanTextField(const uint8_t* p, size_t len) {
-  size_t start = 0;
-  while (start < len && p[start] == 0) ++start;
-  std::string raw(reinterpret_cast<const char*>(p + start), len - start);
-  return CleanText(raw);
+  std::string best;
+  int best_score = -1000000;
+  size_t i = 0;
+  while (i < len) {
+    while (i < len && p[i] == 0) ++i;
+    if (i >= len) break;
+    std::string seg;
+    while (i < len && p[i] != 0) {
+      unsigned char c = p[i++];
+      if (c >= 32) seg.push_back(static_cast<char>(c));
+    }
+    seg = Trim(seg);
+    if (seg.empty()) continue;
+    int sc = ScoreNameSegment(seg);
+    if (sc > best_score) {
+      best_score = sc;
+      best = seg;
+    }
+  }
+  return best;
 }
 
 std::string BytesToHex(const uint8_t* data, size_t len) {
