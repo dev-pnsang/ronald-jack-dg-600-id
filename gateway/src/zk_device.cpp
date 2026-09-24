@@ -196,6 +196,8 @@ std::string CleanTextField(const uint8_t* p, size_t len) {
       best = seg;
     }
   }
+  // Drop high-bit stubs when no ASCII name was enrolled on the terminal.
+  if (best_score < 0) return {};
   return best;
 }
 
