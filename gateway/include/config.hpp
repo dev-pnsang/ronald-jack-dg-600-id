@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace cg {
 
@@ -24,10 +26,19 @@ struct Config {
   std::string agent_version = "1.0.0";
 
   // Behavior
-  bool live_listen = true;
-  bool poll_fallback = true;       // also pull recent ATTLOG when live is quiet
-  int poll_interval_sec = 30;
+  bool live_listen = false;
+  bool poll_fallback = false;
+  /** Pull org attendance_devices (with IP) from CommaDesk and poll each. */
+  bool discover_terminals = true;
+  int catalog_refresh_sec = 300;      // refresh terminal list only (no ATTLOG)
+  int poll_interval_sec = 43200;     // unused — ATTLOG at 00:00 & 12:00 only
   bool ingest_minimal = false;     // only attendance_code + timestamp
+  // Device wall-clock TZ offset east of UTC in minutes (420 = Asia/Ho_Chi_Minh)
+  int device_tz_offset_min = 420;
+  // Drop punches older than this (vs gateway local clock)
+  int punch_max_age_sec = 300;
+  // Reject device years below this (clock not synced)
+  int punch_min_year = 2020;
   int reconnect_delay_sec = 5;
   int outbox_retry_sec = 15;
   int outbox_max_attempts = 50;
@@ -40,5 +51,10 @@ struct Config {
 bool LoadConfig(const std::string& path, Config& out, std::string& err);
 
 bool ParseBool(const std::string& val, bool default_value = false);
+
+// Upsert key=value lines in a config file (preserves comments/order).
+bool UpsertConfigKeys(const std::string& path,
+                      const std::vector<std::pair<std::string, std::string>>& kv,
+                      std::string& err);
 
 }  // namespace cg

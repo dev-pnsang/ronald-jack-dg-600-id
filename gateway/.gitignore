@@ -1,0 +1,8 @@
+/build/
+/dist/
+/data/
+*.deb
+config/checkin-gateway.conf
+*.db
+*.db-shm
+*.db-wal

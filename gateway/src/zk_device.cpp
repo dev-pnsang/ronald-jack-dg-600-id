@@ -1,4 +1,5 @@
 #include "zk_device.hpp"
+#include <algorithm>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <map>
 
+#include "log.hpp"
 #include "util.hpp"
 
 namespace cg {
@@ -33,12 +35,10 @@ constexpr uint16_t CMD_USERTEMP_RRQ = 9;
 constexpr uint16_t CMD_ATTLOG_RRQ = 13;
 constexpr uint16_t CMD_DEVICE = 11;
 constexpr uint16_t CMD_GET_TIME = 201;
+constexpr uint16_t CMD_SET_TIME = 202;
+constexpr uint16_t CMD_GET_FREE_SIZES = 50;
 constexpr uint16_t CMD_REG_EVENT = 500;
-constexpr uint16_t CMD_ACK_UNAUTH_ALT = 2005;
 constexpr uint16_t EF_ATTLOG = 1;
-
-constexpr size_t USHORT_SIZE = 2;
-constexpr size_t ULONG_SIZE = 4;
 
 uint16_t ReadU16(const uint8_t* p) {
   return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -61,22 +61,27 @@ void WriteU32(std::vector<uint8_t>& buf, uint32_t v) {
 }
 
 uint16_t Checksum(const std::vector<uint8_t>& payload) {
-  uint32_t chk = 0;
-  size_t i = 0;
-  for (; i + 1 < payload.size(); i += 2) {
-    chk += ReadU16(payload.data() + i);
-    chk &= 0xFFFF;
+  // Match pyzk ZK._ZK__create_checksum (from zkemsdk.c).
+  int32_t checksum = 0;
+  size_t off = 0;
+  size_t l = payload.size();
+  while (l > 1) {
+    checksum += static_cast<int32_t>(payload[off] | (payload[off + 1] << 8));
+    off += 2;
+    l -= 2;
+    if (checksum > 65535) checksum -= 65535;
   }
-  if (i < payload.size()) {
-    chk += payload[i];
-    chk &= 0xFFFF;
-  }
-  chk = (~chk) & 0xFFFF;
-  return static_cast<uint16_t>((chk + 1) & 0xFFFF);
+  if (l) checksum += payload[off];
+  while (checksum > 65535) checksum -= 65535;
+  checksum = ~checksum;
+  while (checksum < 0) checksum += 65535;
+  return static_cast<uint16_t>(checksum & 0xFFFF);
 }
 
-std::vector<uint8_t> MakePacket(uint16_t command, uint16_t session_id, uint16_t reply_id,
+std::vector<uint8_t> MakePacket(uint16_t command, uint16_t session_id, uint16_t& reply_id,
                                 const std::vector<uint8_t>& data) {
+  // pyzk: checksum over header with *current* reply_id, then reply_id = (reply_id+1) % 65535
+  // and the transmitted header uses the incremented reply_id.
   std::vector<uint8_t> body;
   WriteU16(body, command);
   WriteU16(body, 0);  // checksum placeholder
@@ -84,8 +89,14 @@ std::vector<uint8_t> MakePacket(uint16_t command, uint16_t session_id, uint16_t 
   WriteU16(body, reply_id);
   body.insert(body.end(), data.begin(), data.end());
   uint16_t chk = Checksum(body);
-  body[2] = static_cast<uint8_t>(chk & 0xFF);
-  body[3] = static_cast<uint8_t>((chk >> 8) & 0xFF);
+  reply_id = static_cast<uint16_t>(reply_id + 1);
+  if (reply_id >= 65535) reply_id = static_cast<uint16_t>(reply_id - 65535);
+  body.clear();
+  WriteU16(body, command);
+  WriteU16(body, chk);
+  WriteU16(body, session_id);
+  WriteU16(body, reply_id);
+  body.insert(body.end(), data.begin(), data.end());
 
   std::vector<uint8_t> packet;
   packet.push_back(0x50);
@@ -137,7 +148,40 @@ std::string CleanText(const std::string& s) {
   return Trim(out);
 }
 
+// Extract first printable C-string inside a fixed field (skip leading NULs).
+std::string CleanTextField(const uint8_t* p, size_t len) {
+  size_t start = 0;
+  while (start < len && p[start] == 0) ++start;
+  std::string raw(reinterpret_cast<const char*>(p + start), len - start);
+  return CleanText(raw);
+}
+
+std::string BytesToHex(const uint8_t* data, size_t len) {
+  return HexEncode(data, len);
+}
+
+std::string BytesToHex(const std::vector<uint8_t>& v) { return BytesToHex(v.data(), v.size()); }
+
 }  // namespace
+
+std::string RawBlob::hex() const { return HexEncode(bytes.data(), bytes.size()); }
+
+uint32_t EncodeZkTime(int year, int month, int day, int hour, int minute, int second) {
+  return static_cast<uint32_t>(((year - 2000) * 12 * 31 + (month - 1) * 31 + (day - 1)) *
+                                   (24 * 60 * 60) +
+                               (hour * 60 + minute) * 60 + second);
+}
+
+bool DecodeZkTime(uint32_t t, int& year, int& month, int& day, int& hour, int& minute,
+                  int& second) {
+  second = static_cast<int>(t % 60);
+  minute = static_cast<int>((t / 60) % 60);
+  hour = static_cast<int>((t / 3600) % 24);
+  day = static_cast<int>(((t / (3600 * 24)) % 31) + 1);
+  month = static_cast<int>(((t / (3600 * 24 * 31)) % 12) + 1);
+  year = static_cast<int>((t / (3600 * 24 * 31 * 12)) + 2000);
+  return year >= 2000 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
 
 const char* VerifyModeText(int mode) {
   switch (mode) {
@@ -170,6 +214,16 @@ const char* InOutModeText(int mode) {
   }
 }
 
+const char* PrivilegeText(int privilege) {
+  switch (privilege) {
+    case 0: return "user";
+    case 2: return "enroller";
+    case 6: return "admin";
+    case 14: return "super_admin";
+    default: return "unknown";
+  }
+}
+
 ZkDevice::ZkDevice() = default;
 
 ZkDevice::~ZkDevice() { Disconnect(); }
@@ -197,7 +251,7 @@ bool ZkDevice::CreateSocket(std::string& err) {
     return false;
   }
   if (!WaitWritable(fd_, timeout_sec_ * 1000)) {
-    err = "connect timeout";
+    err = "Connection timeout";
     CloseSocket();
     return false;
   }
@@ -205,12 +259,11 @@ bool ZkDevice::CreateSocket(std::string& err) {
   socklen_t len = sizeof(so_error);
   getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len);
   if (so_error != 0) {
-    err = std::string("connect failed: ") + std::strerror(so_error);
+    err = std::string("Connection failed: ") + std::strerror(so_error);
     CloseSocket();
     return false;
   }
   SetNonBlocking(fd_, false);
-  // Set recv timeout
   timeval tv{};
   tv.tv_sec = timeout_sec_;
   setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -233,7 +286,7 @@ bool ZkDevice::RecvPacket(std::vector<uint8_t>& payload, uint16_t& command, std:
     return false;
   }
   if (!WaitReadable(fd_, timeout_ms)) {
-    err = "recv timeout";
+    err = "Connection timeout";
     return false;
   }
   uint8_t header[8];
@@ -241,37 +294,39 @@ bool ZkDevice::RecvPacket(std::vector<uint8_t>& payload, uint16_t& command, std:
   while (got < sizeof(header)) {
     ssize_t n = ::recv(fd_, header + got, sizeof(header) - got, 0);
     if (n <= 0) {
-      err = "recv header failed";
+      err = "Device disconnected";
       return false;
     }
     got += static_cast<size_t>(n);
   }
   if (header[0] != 0x50 || header[1] != 0x50 || header[2] != 0x82 || header[3] != 0x7D) {
-    err = "bad packet magic";
+    err = "Invalid response: bad packet magic";
     return false;
   }
   uint32_t size = ReadU32(header + 4);
   if (size < 8 || size > 1024 * 1024) {
-    err = "bad packet size";
+    err = "Invalid response: bad packet size";
     return false;
   }
   std::vector<uint8_t> body(size);
   got = 0;
   while (got < size) {
     if (!WaitReadable(fd_, timeout_ms)) {
-      err = "recv body timeout";
+      err = "Connection timeout";
       return false;
     }
     ssize_t n = ::recv(fd_, body.data() + got, size - got, 0);
     if (n <= 0) {
-      err = "recv body failed";
+      err = "Device disconnected";
       return false;
     }
     got += static_cast<size_t>(n);
   }
   command = ReadU16(body.data());
+  // session_id is echoed/assigned by device in response header (pyzk uses this)
   session_id_ = ReadU16(body.data() + 4);
-  reply_id_ = static_cast<uint16_t>((ReadU16(body.data() + 6) + 1) & 0xFFFF);
+  // reply_id counter is owned by MakePacket (increments on send). Do NOT overwrite from
+  // response the way older code did — that desyncs checksum vs pyzk.
   payload.assign(body.begin() + 8, body.end());
   return true;
 }
@@ -284,18 +339,18 @@ bool ZkDevice::SendCommand(uint16_t command, const std::vector<uint8_t>& data,
   while (sent < packet.size()) {
     ssize_t n = ::send(fd_, packet.data() + sent, packet.size() - sent, 0);
     if (n <= 0) {
-      err = "send failed";
+      err = "Device disconnected";
       return false;
     }
     sent += static_cast<size_t>(n);
   }
   if (!RecvPacket(reply, reply_cmd, err, timeout_ms)) return false;
-  if (reply_cmd == CMD_ACK_UNAUTH || reply_cmd == CMD_ACK_UNAUTH_ALT) {
-    err = "device unauthorized (need comm password?)";
+  if (reply_cmd == CMD_ACK_UNAUTH) {
+    err = "Authentication failed (device unauthorized — need comm password?)";
     return false;
   }
   if (reply_cmd == CMD_ACK_ERROR) {
-    err = "device returned ACK_ERROR";
+    err = "Unsupported command or device ACK_ERROR";
     return false;
   }
   return true;
@@ -303,23 +358,18 @@ bool ZkDevice::SendCommand(uint16_t command, const std::vector<uint8_t>& data,
 
 bool ZkDevice::Handshake(std::string& err) {
   session_id_ = 0;
-  reply_id_ = 0;
+  reply_id_ = 65534;  // pyzk: USHRT_MAX - 1
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
   if (!SendCommand(CMD_CONNECT, {}, reply, cmd, err)) return false;
-  if (cmd != CMD_ACK_OK && cmd != CMD_ACK_UNAUTH) {
-    // Some firmwares reply ACK_OK; unauth means password required next.
-  }
   return true;
 }
 
 bool ZkDevice::Authenticate(int password, std::string& err) {
   if (password == 0) return true;
-  // CMD_AUTH = 1102 with session-based hash (pyzk make_commkey)
   constexpr uint16_t CMD_AUTH = 1102;
   uint32_t key = static_cast<uint32_t>(password);
   uint32_t session = session_id_;
-  // pyzk: make_commkey
   uint32_t k = 0;
   for (int i = 0; i < 32; ++i) {
     if (key & (1u << i)) k = (k << 1) | 1;
@@ -331,10 +381,8 @@ bool ZkDevice::Authenticate(int password, std::string& err) {
   data[1] = static_cast<uint8_t>((k >> 8) & 0xFF);
   data[2] = static_cast<uint8_t>((k >> 16) & 0xFF);
   data[3] = static_cast<uint8_t>((k >> 24) & 0xFF);
-  // XOR with 'ZKSO' pattern like pyzk
   static const uint8_t xor_key[4] = {0x5A, 0x4B, 0x53, 0x4F};  // ZKSO
   for (int i = 0; i < 4; ++i) data[i] ^= xor_key[i];
-  // Swap bytes per pyzk
   std::swap(data[0], data[2]);
   std::swap(data[1], data[3]);
   for (int i = 0; i < 4; ++i) data[i] = static_cast<uint8_t>((~data[i]) & 0xFF);
@@ -343,7 +391,7 @@ bool ZkDevice::Authenticate(int password, std::string& err) {
   uint16_t cmd = 0;
   if (!SendCommand(CMD_AUTH, data, reply, cmd, err)) return false;
   if (cmd != CMD_ACK_OK) {
-    err = "auth failed";
+    err = "Authentication failed";
     return false;
   }
   return true;
@@ -357,22 +405,63 @@ bool ZkDevice::EnableDevice(bool enable, std::string& err) {
 
 bool ZkDevice::GetString(uint16_t /*command*/, const std::string& param, std::string& value,
                          std::string& err) {
-  // CMD_OPTIONS_RRQ = 11 with "~SerialNumber\0" style via CMD_DEVICE
-  std::vector<uint8_t> data(param.begin(), param.end());
+  auto r = ProbeOption(param);
+  if (r.status == "FAILED" || r.status == "NOT_SUPPORTED") {
+    err = r.error.empty() ? r.status : r.error;
+    value.clear();
+    return false;
+  }
+  value = r.value;
+  err.clear();
+  return true;
+}
+
+DeviceOptionResult ZkDevice::ProbeOption(const std::string& key) {
+  DeviceOptionResult r;
+  r.key = key;
+  if (!connected_) {
+    r.status = "FAILED";
+    r.error = "not connected";
+    return r;
+  }
+  std::vector<uint8_t> data(key.begin(), key.end());
   data.push_back(0);
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
-  if (!SendCommand(CMD_DEVICE, data, reply, cmd, err)) return false;
-  if (cmd != CMD_ACK_OK && cmd != CMD_ACK_DATA) {
-    value.clear();
-    return true;  // optional fields
+  std::string err;
+  if (!SendCommand(CMD_DEVICE, data, reply, cmd, err)) {
+    // ACK_ERROR often means unsupported option on this firmware
+    if (err.find("ACK_ERROR") != std::string::npos ||
+        err.find("Unsupported command") != std::string::npos) {
+      r.status = "NOT_SUPPORTED";
+    } else {
+      r.status = "FAILED";
+    }
+    r.error = err;
+    r.reply_cmd = cmd;
+    return r;
   }
-  // Reply often "SerialNumber=XXXX\0"
+  r.reply_cmd = cmd;
+  r.raw_hex = BytesToHex(reply);
+  if (cmd != CMD_ACK_OK && cmd != CMD_ACK_DATA) {
+    r.status = "NOT_SUPPORTED";
+    r.error = "unexpected reply_cmd=" + std::to_string(cmd);
+    return r;
+  }
+  if (reply.empty()) {
+    r.status = "empty";
+    return r;
+  }
   std::string raw(reply.begin(), reply.end());
   auto eq = raw.find('=');
-  if (eq != std::string::npos) value = CleanText(raw.substr(eq + 1));
-  else value = CleanText(raw);
-  return true;
+  if (eq != std::string::npos) r.value = CleanText(raw.substr(eq + 1));
+  else r.value = CleanText(raw);
+  if (r.value.empty()) {
+    r.status = "empty";
+  } else {
+    r.status = "ok";
+  }
+  return r;
 }
 
 bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeout_sec,
@@ -382,19 +471,28 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
   port_ = port;
   password_ = password;
   timeout_sec_ = timeout_sec > 0 ? timeout_sec : 10;
-  if (!CreateSocket(err)) return false;
+  LogInfo("Connecting to " + ip_ + ":" + std::to_string(port_) + " via " + ProtocolName());
+  if (!CreateSocket(err)) {
+    LogError("Connection failed: " + err);
+    return false;
+  }
   if (!Handshake(err)) {
+    LogError("Handshake failed: " + err);
     CloseSocket();
     return false;
   }
   if (!Authenticate(password, err)) {
+    LogError("Authentication failed: " + err);
     CloseSocket();
     return false;
   }
-  EnableDevice(true, err);  // best-effort
+  std::string e2;
+  EnableDevice(true, e2);  // best-effort
   connected_ = true;
   info_.ip = ip_;
   info_.port = port_;
+  LogInfo("Connection success: " + ip_ + ":" + std::to_string(port_) + " protocol=" +
+          ProtocolName());
   return true;
 }
 
@@ -411,6 +509,86 @@ void ZkDevice::Disconnect() {
   live_ = false;
 }
 
+bool ZkDevice::GetTime(DeviceTime& out, std::string& err) {
+  out = DeviceTime{};
+  if (!connected_) {
+    err = "not connected";
+    return false;
+  }
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  if (!SendCommand(CMD_GET_TIME, {}, reply, cmd, err)) return false;
+  out.raw_hex = BytesToHex(reply);
+  if (reply.size() < 4) {
+    err = "Invalid response: GET_TIME payload too short";
+    return false;
+  }
+  out.encoded = ReadU32(reply.data());
+  if (!DecodeZkTime(out.encoded, out.year, out.month, out.day, out.hour, out.minute, out.second)) {
+    err = "Parse error: invalid ZK time encoding";
+    return false;
+  }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", out.year, out.month, out.day,
+                out.hour, out.minute, out.second);
+  out.iso_local = buf;
+  return true;
+}
+
+bool ZkDevice::SetTime(int year, int month, int day, int hour, int minute, int second,
+                       std::string& err) {
+  if (!connected_) {
+    err = "not connected";
+    return false;
+  }
+  uint32_t enc = EncodeZkTime(year, month, day, hour, minute, second);
+  std::vector<uint8_t> data;
+  WriteU32(data, enc);
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  if (!SendCommand(CMD_SET_TIME, data, reply, cmd, err)) return false;
+  if (cmd != CMD_ACK_OK) {
+    err = "SET_TIME failed reply_cmd=" + std::to_string(cmd);
+    return false;
+  }
+  return true;
+}
+
+bool ZkDevice::ReadFreeSizes(DeviceInfo& info, RawBlob& raw, std::string& err) {
+  raw = RawBlob{};
+  raw.label = "CMD_GET_FREE_SIZES";
+  if (!connected_) {
+    err = "not connected";
+    raw.status = "FAILED";
+    raw.error = err;
+    return false;
+  }
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  if (!SendCommand(CMD_GET_FREE_SIZES, {}, reply, cmd, err)) {
+    raw.status = "FAILED";
+    raw.error = err;
+    raw.reply_cmd = cmd;
+    return false;
+  }
+  raw.reply_cmd = cmd;
+  raw.bytes = reply;
+  raw.status = reply.empty() ? "empty" : "ok";
+  // pyzk layout: various offsets; common: users at 4, fingers at 24? — parse cautiously
+  // ZK free sizes typically 92+ bytes. Users count often at offset 4 (u32), records at 8 or similar.
+  if (reply.size() >= 8) {
+    info.user_count = static_cast<int>(ReadU32(reply.data() + 4));
+  }
+  if (reply.size() >= 16) {
+    info.finger_count = static_cast<int>(ReadU32(reply.data() + 8));
+  }
+  if (reply.size() >= 20) {
+    info.log_count = static_cast<int>(ReadU32(reply.data() + 12));
+  }
+  // Some firmwares use different packing; keep raw always.
+  return true;
+}
+
 bool ZkDevice::ReadDeviceInfo(DeviceInfo& out, std::string& err) {
   if (!connected_) {
     err = "not connected";
@@ -419,172 +597,193 @@ bool ZkDevice::ReadDeviceInfo(DeviceInfo& out, std::string& err) {
   out = DeviceInfo{};
   out.ip = ip_;
   out.port = port_;
-  GetString(CMD_DEVICE, "~SerialNumber", out.serial, err);
-  GetString(CMD_DEVICE, "~OEMVendor", out.platform, err);
-  GetString(CMD_DEVICE, "~DeviceName", out.firmware, err);
-  if (out.firmware.empty()) GetString(CMD_DEVICE, "FirmVer", out.firmware, err);
 
-  // Device time
-  std::vector<uint8_t> reply;
-  uint16_t cmd = 0;
-  if (SendCommand(CMD_GET_TIME, {}, reply, cmd, err) && reply.size() >= 4) {
-    uint32_t t = ReadU32(reply.data());
-    // ZK encoded datetime
-    int second = static_cast<int>(t % 60);
-    int minute = static_cast<int>((t / 60) % 60);
-    int hour = static_cast<int>((t / 3600) % 24);
-    int day = static_cast<int>(((t / (3600 * 24)) % 31) + 1);
-    int month = static_cast<int>(((t / (3600 * 24 * 31)) % 12) + 1);
-    int year = static_cast<int>((t / (3600 * 24 * 31 * 12)) + 2000);
-    out.device_time_iso = FormatIso8601Utc(year, month, day, hour, minute, second);
+  auto serial = ProbeOption("~SerialNumber");
+  if (serial.status == "ok") out.serial = serial.value;
+
+  auto oem = ProbeOption("~OEMVendor");
+  if (oem.status == "ok") out.platform = oem.value;
+  if (out.platform.empty()) {
+    auto plat = ProbeOption("~Platform");
+    if (plat.status == "ok") out.platform = plat.value;
   }
+
+  auto dname = ProbeOption("~DeviceName");
+  if (dname.status == "ok") out.device_name = dname.value;
+  auto firm = ProbeOption("FirmVer");
+  if (firm.status == "ok") out.firmware = firm.value;
+  if (out.firmware.empty() && dname.status == "ok") out.firmware = dname.value;
+
+  DeviceTime dt;
+  if (GetTime(dt, err)) {
+    out.device_time_local = dt.iso_local;
+    out.device_time_iso = FormatIso8601Offset(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, tz_offset_min_);
+  } else {
+    LogWarning("GET_TIME failed: " + err);
+    err.clear();
+  }
+
+  RawBlob sizes;
+  std::string e2;
+  if (!ReadFreeSizes(out, sizes, e2)) {
+    LogDebug("GET_FREE_SIZES: " + e2);
+  }
+
   info_ = out;
   return true;
 }
 
-bool ZkDevice::ReadUsers(std::vector<UserRecord>& out, std::string& err) {
-  out.clear();
-  if (!connected_) {
-    err = "not connected";
+bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req, RawBlob& raw,
+                              std::string& err) {
+  raw = RawBlob{};
+  raw.label = "cmd_" + std::to_string(command);
+  const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 120000);
+  if (!EnableDevice(false, err)) {
+    raw.status = "FAILED";
+    raw.error = std::string("disable before bulk: ") + err;
     return false;
   }
-  // Request users via CMD_USERTEMP_RRQ with flag 5 (users only) — same as pyzk get_users
-  std::vector<uint8_t> data = {0x05};
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
-  if (!EnableDevice(false, err)) return false;
-  bool ok = SendCommand(CMD_USERTEMP_RRQ, data, reply, cmd, err, timeout_sec_ * 1000);
+  LogInfo("Bulk request cmd=" + std::to_string(command) + " timeout_ms=" +
+          std::to_string(bulk_timeout_ms));
+  bool ok = SendCommand(command, req, reply, cmd, err, bulk_timeout_ms);
   if (!ok) {
+    raw.status = "FAILED";
+    raw.error = err;
+    raw.reply_cmd = cmd;
     EnableDevice(true, err);
     return false;
   }
-
+  raw.reply_cmd = cmd;
   std::vector<uint8_t> blob;
   if (cmd == CMD_PREPARE_DATA && reply.size() >= 4) {
     uint32_t size = ReadU32(reply.data());
+    LogInfo("PREPARE_DATA size=" + std::to_string(size));
     blob.reserve(size);
     while (blob.size() < size) {
       std::vector<uint8_t> chunk;
       uint16_t c = 0;
-      if (!RecvPacket(chunk, c, err, timeout_sec_ * 1000)) {
+      if (!RecvPacket(chunk, c, err, bulk_timeout_ms)) {
+        raw.status = "FAILED";
+        raw.error = err + " (got " + std::to_string(blob.size()) + "/" + std::to_string(size) + ")";
+        raw.bytes = blob;
         EnableDevice(true, err);
         return false;
       }
       if (c == CMD_DATA) {
         blob.insert(blob.end(), chunk.begin(), chunk.end());
+        if (blob.size() % 50000 < chunk.size()) {
+          LogDebug("bulk progress " + std::to_string(blob.size()) + "/" + std::to_string(size));
+        }
       } else if (c == CMD_ACK_OK) {
         break;
       } else {
+        LogWarning("bulk unexpected cmd=" + std::to_string(c) + " len=" +
+                   std::to_string(chunk.size()));
         break;
       }
     }
     std::vector<uint8_t> freply;
     uint16_t fcmd = 0;
-    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, err, 3000);
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, err, 5000);
   } else if (cmd == CMD_DATA || cmd == CMD_ACK_OK) {
     blob = reply;
+  } else {
+    raw.status = "FAILED";
+    raw.error = "unexpected reply_cmd=" + std::to_string(cmd);
+    raw.bytes = reply;
+    std::string e2;
+    EnableDevice(true, e2);
+    return false;
   }
-  EnableDevice(true, err);
-
-  // SSR user record: 72 bytes typical
-  const size_t rec = 72;
-  for (size_t off = 0; off + rec <= blob.size(); off += rec) {
-    const uint8_t* p = blob.data() + off;
-    UserRecord u;
-    // uid at 0 (u16), privilege at 2, password 3..11, name 11..35, card 35..39, userid string 48..72
-    u.privilege = p[2];
-    char name[28] = {};
-    std::memcpy(name, p + 11, 24);
-    u.name = CleanText(name);
-    char uidstr[28] = {};
-    std::memcpy(uidstr, p + 48, 24);
-    u.user_id = CleanText(uidstr);
-    if (u.user_id.empty()) {
-      uint16_t uid = ReadU16(p);
-      if (uid == 0) continue;
-      u.user_id = std::to_string(uid);
+  {
+    std::string e_en;
+    if (!EnableDevice(true, e_en)) {
+      LogWarning("EnableDevice after bulk failed: " + e_en);
     }
-    u.enabled = (p[0] != 0) || !u.user_id.empty();
+  }
+  raw.bytes = std::move(blob);
+  raw.status = raw.bytes.empty() ? "empty" : "ok";
+  LogInfo("Bulk done cmd=" + std::to_string(command) + " bytes=" + std::to_string(raw.bytes.size()));
+  return true;
+}
+
+bool ZkDevice::ReadUsersRaw(std::vector<UserRecord>& out, RawBlob& raw, std::string& err) {
+  out.clear();
+  if (!connected_) {
+    err = "not connected";
+    return false;
+  }
+  std::vector<uint8_t> data = {0x05};
+  if (!FetchLargeData(CMD_USERTEMP_RRQ, data, raw, err)) return false;
+  raw.label = "CMD_USERTEMP_RRQ_users";
+
+  const size_t rec = 72;
+  for (size_t off = 0; off + rec <= raw.bytes.size(); off += rec) {
+    const uint8_t* p = raw.bytes.data() + off;
+    UserRecord u;
+    u.uid = ReadU16(p);
+    u.privilege = p[2];
+    u.password = CleanTextField(p + 3, 8);
+    u.name = CleanTextField(p + 11, 24);
+    u.card = ReadU32(p + 35);
+    u.user_id = CleanTextField(p + 48, 24);
+    if (u.user_id.empty()) {
+      if (u.uid == 0) continue;
+      u.user_id = std::to_string(u.uid);
+    }
+    u.enabled = true;
+    u.raw_hex = BytesToHex(p, rec);
     out.push_back(u);
   }
   users_cache_ = out;
   return true;
 }
 
-bool ZkDevice::ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err) {
+bool ZkDevice::ReadUsers(std::vector<UserRecord>& out, std::string& err) {
+  RawBlob raw;
+  return ReadUsersRaw(out, raw, err);
+}
+
+bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob& raw,
+                                     std::string& err) {
   out.clear();
   if (!connected_) {
     err = "not connected";
     return false;
   }
-  // Temporarily stop live so ATTLOG_RRQ is not interleaved with events.
   bool was_live = live_;
   if (was_live) StopLiveCapture();
 
-  if (!EnableDevice(false, err)) {
-    if (was_live) StartLiveCapture(err);
-    return false;
-  }
-
-  std::vector<uint8_t> reply;
-  uint16_t cmd = 0;
-  bool ok = SendCommand(CMD_ATTLOG_RRQ, {}, reply, cmd, err, timeout_sec_ * 1000);
-  if (!ok) {
-    EnableDevice(true, err);
-    if (was_live) StartLiveCapture(err);
-    return false;
-  }
-
-  std::vector<uint8_t> blob;
-  if (cmd == CMD_PREPARE_DATA && reply.size() >= 4) {
-    uint32_t size = ReadU32(reply.data());
-    blob.reserve(size);
-    while (blob.size() < size) {
-      std::vector<uint8_t> chunk;
-      uint16_t c = 0;
-      if (!RecvPacket(chunk, c, err, timeout_sec_ * 1000)) {
-        EnableDevice(true, err);
-        if (was_live) StartLiveCapture(err);
-        return false;
-      }
-      if (c == CMD_DATA) {
-        blob.insert(blob.end(), chunk.begin(), chunk.end());
-      } else if (c == CMD_ACK_OK) {
-        break;
-      } else {
-        break;
-      }
+  if (!FetchLargeData(CMD_ATTLOG_RRQ, {}, raw, err)) {
+    if (was_live) {
+      std::string e2;
+      StartLiveCapture(e2);
     }
-    std::vector<uint8_t> freply;
-    uint16_t fcmd = 0;
-    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, err, 3000);
-  } else if (cmd == CMD_DATA || cmd == CMD_ACK_OK) {
-    blob = reply;
+    return false;
   }
+  raw.label = "CMD_ATTLOG_RRQ";
 
-  EnableDevice(true, err);
   if (was_live) {
     std::string e2;
     StartLiveCapture(e2);
   }
 
-  // SSR attendance record: typically 40 bytes
-  // user_id[24] + time(u32) + status(u8) + punch(u8) + reserved...
   const size_t rec = 40;
   std::string received = UtcNowIso8601();
-  for (size_t off = 0; off + 16 <= blob.size();) {
-    size_t step = (off + rec <= blob.size()) ? rec : 16;
-    const uint8_t* p = blob.data() + off;
+  for (size_t off = 0; off + 16 <= raw.bytes.size();) {
+    size_t step = (off + rec <= raw.bytes.size()) ? rec : 16;
+    const uint8_t* p = raw.bytes.data() + off;
     AttendanceEvent ev;
     ev.from_live = false;
     ev.received_at_iso = received;
 
     char uidstr[28] = {};
     std::memcpy(uidstr, p, 24);
-    ev.user_id = CleanText(uidstr);
+    ev.user_id = CleanTextField(p, 24);
     size_t time_off = 24;
     if (ev.user_id.empty()) {
-      // legacy: uid u16 at 0, time at 4
       uint16_t uid = ReadU16(p);
       if (uid == 0) {
         off += step;
@@ -594,22 +793,17 @@ bool ZkDevice::ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string
       time_off = 4;
       step = 16;
     }
-    if (time_off + 4 > blob.size() - off) break;
+    if (time_off + 4 > raw.bytes.size() - off) break;
     uint32_t t = ReadU32(p + time_off);
-    ev.second = static_cast<int>(t % 60);
-    ev.minute = static_cast<int>((t / 60) % 60);
-    ev.hour = static_cast<int>((t / 3600) % 24);
-    ev.day = static_cast<int>(((t / (3600 * 24)) % 31) + 1);
-    ev.month = static_cast<int>(((t / (3600 * 24 * 31)) % 12) + 1);
-    ev.year = static_cast<int>((t / (3600 * 24 * 31 * 12)) + 2000);
-    if (ev.year < 2000 || ev.year > 2099) {
+    if (!DecodeZkTime(t, ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second)) {
       off += step;
       continue;
     }
-    ev.timestamp_iso = FormatIso8601Utc(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second);
+    ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second, tz_offset_min_);
     if (time_off + 4 < step) ev.verify_mode = p[time_off + 4];
     if (time_off + 5 < step) ev.inout_mode = p[time_off + 5];
     if (time_off + 6 < step) ev.work_code = p[time_off + 6];
+    ev.raw_hex = BytesToHex(p, step);
     for (const auto& u : users_cache_) {
       if (u.user_id == ev.user_id) {
         ev.user_name = u.name;
@@ -622,14 +816,18 @@ bool ZkDevice::ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string
   return true;
 }
 
+bool ZkDevice::ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err) {
+  RawBlob raw;
+  return ReadAttendanceLogsRaw(out, raw, err);
+}
+
 bool ZkDevice::StartLiveCapture(std::string& err) {
   if (!connected_) {
     err = "not connected";
     return false;
   }
-  // RegEvent with EF_ATTLOG mask (and related)
   std::vector<uint8_t> data;
-  WriteU32(data, 0xFFFF);  // all events — mirrors SDK RegEvent(machine, 65535)
+  WriteU32(data, 0xFFFF);
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
   if (!SendCommand(CMD_REG_EVENT, data, reply, cmd, err)) return false;
@@ -638,6 +836,7 @@ bool ZkDevice::StartLiveCapture(std::string& err) {
     return false;
   }
   live_ = true;
+  LogInfo("Realtime live capture ON (RegEvent mask=0xFFFF)");
   return true;
 }
 
@@ -656,16 +855,13 @@ void ZkDevice::StopLiveCapture() {
 }
 
 bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& ev) {
-  // Realtime ATTLOG: typically 36+ bytes (user_id string / uid + time + status + punch)
-  // pyzk live_capture parses several formats. Support common SSR-style:
-  // [userid\0...][time u32][status][punch] or 40-byte variant.
   if (data.size() < 12) return false;
 
   ev = AttendanceEvent{};
   ev.from_live = true;
   ev.received_at_iso = UtcNowIso8601();
+  ev.raw_hex = BytesToHex(data);
 
-  // Try string user id at start (null-terminated, up to 9–24 chars)
   std::string uid;
   size_t i = 0;
   for (; i < data.size() && i < 24; ++i) {
@@ -682,40 +878,49 @@ bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& 
   }
   ev.user_id = CleanText(uid);
 
-  // Align to time field — common layouts put time at offset 8 or after userid padded to 9
-  size_t time_off = 8;
-  if (data.size() >= 16) {
-    // Heuristic: if bytes 8..11 look like ZK time, use them
-    time_off = (i <= 8) ? 8 : i;
-    if (time_off + 4 > data.size()) time_off = data.size() - 6;
+  auto fill_local_now = [&]() {
+    std::time_t now = std::time(nullptr);
+    std::tm tmb{};
+    localtime_r(&now, &tmb);
+    ev.year = tmb.tm_year + 1900;
+    ev.month = tmb.tm_mon + 1;
+    ev.day = tmb.tm_mday;
+    ev.hour = tmb.tm_hour;
+    ev.minute = tmb.tm_min;
+    ev.second = tmb.tm_sec;
+  };
+
+  // DG-600 live packets often pad PIN to 24 bytes; time at offset 8 is zeros → year 2000.
+  // Try candidates: after UID, fixed 24 (SSR pad), then 8. Reject year < 2020.
+  size_t time_off = 0;
+  bool time_ok = false;
+  size_t candidates[] = {i, 24, 8};
+  for (size_t cand : candidates) {
+    if (cand + 4 > data.size()) continue;
+    uint32_t enc = ReadU32(data.data() + cand);
+    int y = 0, m = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (!DecodeZkTime(enc, y, m, d, h, mi, s)) continue;
+    if (y < 2020 || y > 2038) continue;
+    ev.year = y;
+    ev.month = m;
+    ev.day = d;
+    ev.hour = h;
+    ev.minute = mi;
+    ev.second = s;
+    time_off = cand;
+    time_ok = true;
+    break;
   }
-  if (time_off + 4 <= data.size()) {
-    uint32_t t = ReadU32(data.data() + time_off);
-    ev.second = static_cast<int>(t % 60);
-    ev.minute = static_cast<int>((t / 60) % 60);
-    ev.hour = static_cast<int>((t / 3600) % 24);
-    ev.day = static_cast<int>(((t / (3600 * 24)) % 31) + 1);
-    ev.month = static_cast<int>(((t / (3600 * 24 * 31)) % 12) + 1);
-    ev.year = static_cast<int>((t / (3600 * 24 * 31 * 12)) + 2000);
-    if (ev.year < 2000 || ev.year > 2099) {
-      // Fallback: use now
-      std::time_t now = std::time(nullptr);
-      std::tm tmb{};
-      gmtime_r(&now, &tmb);
-      ev.year = tmb.tm_year + 1900;
-      ev.month = tmb.tm_mon + 1;
-      ev.day = tmb.tm_mday;
-      ev.hour = tmb.tm_hour;
-      ev.minute = tmb.tm_min;
-      ev.second = tmb.tm_sec;
-    }
+  if (!time_ok) {
+    fill_local_now();
+    time_off = (i + 4 <= data.size()) ? i : 0;
   }
-  ev.timestamp_iso = FormatIso8601Utc(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second);
+  ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second, tz_offset_min_);
 
   size_t status_off = time_off + 4;
-  if (status_off < data.size()) ev.verify_mode = data[status_off];
-  if (status_off + 1 < data.size()) ev.inout_mode = data[status_off + 1];
-  if (status_off + 2 < data.size()) ev.work_code = data[status_off + 2];
+  if (time_ok && status_off < data.size()) ev.verify_mode = data[status_off];
+  if (time_ok && status_off + 1 < data.size()) ev.inout_mode = data[status_off + 1];
+  if (time_ok && status_off + 2 < data.size()) ev.work_code = data[status_off + 2];
 
   for (const auto& u : users_cache_) {
     if (u.user_id == ev.user_id) {
@@ -733,34 +938,41 @@ bool ZkDevice::PollLive(AttendanceCallback cb, int wait_ms, std::string& err) {
   }
   if (!WaitReadable(fd_, wait_ms)) {
     err.clear();
-    return true;  // idle
+    return true;
   }
   std::vector<uint8_t> payload;
   uint16_t cmd = 0;
   if (!RecvPacket(payload, cmd, err, wait_ms > 0 ? wait_ms : 1000)) {
-    // Distinguishing timeout vs disconnect
-    if (err == "recv timeout") {
+    if (err.find("timeout") != std::string::npos || err == "Connection timeout") {
       err.clear();
       return true;
     }
+    LogError("Device disconnected: " + err);
     return false;
   }
-  // Unsolicited realtime: command often EF_ATTLOG (1) or packed in ACK_DATA
+
+  auto try_parse = [&](const std::vector<uint8_t>& data) {
+    AttendanceEvent ev;
+    if (ParseAttEvent(data, ev)) {
+      ev.raw_cmd = cmd;
+      LogInfo("Attendance event received user=" + ev.user_id + " ts=" + ev.timestamp_iso +
+              " verify=" + std::to_string(ev.verify_mode) + " inout=" +
+              std::to_string(ev.inout_mode));
+      if (cb) cb(ev);
+    }
+  };
+
   if (cmd == EF_ATTLOG || cmd == 1 || cmd == CMD_REG_EVENT || cmd == CMD_ACK_DATA ||
       cmd == CMD_DATA) {
-    AttendanceEvent ev;
-    if (ParseAttEvent(payload, ev)) {
-      if (cb) cb(ev);
-    }
+    try_parse(payload);
   }
-  // Some devices send nested: first byte event code
-  if (payload.size() > 1 && (payload[0] == 1 /*ATTLOG*/)) {
-    AttendanceEvent ev;
+  if (payload.size() > 1 && payload[0] == 1) {
     std::vector<uint8_t> slice(payload.begin() + 1, payload.end());
-    if (ParseAttEvent(slice, ev)) {
-      if (cb) cb(ev);
-    }
+    try_parse(slice);
   }
+  // Always keep unknown realtime packets in debug
+  LogDebug("live packet cmd=" + std::to_string(cmd) + " len=" + std::to_string(payload.size()) +
+           " hex=" + BytesToHex(payload).substr(0, 128));
   return true;
 }
 

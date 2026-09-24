@@ -13,6 +13,10 @@
 #include <iomanip>
 #include <sstream>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <net/if.h>
 
 namespace cg {
 
@@ -22,6 +26,7 @@ std::string Trim(std::string s) {
   s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
   return s;
 }
+
 
 std::string ToLower(std::string s) {
   for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -46,11 +51,19 @@ std::string UtcNowIso8601() {
 }
 
 std::string FormatIso8601Utc(int year, int month, int day, int hour, int minute, int second) {
-  // Device stamps are wall-clock without TZ. Treat as UTC for API contract (ISO-8601 Z).
-  // Org can reinterpret on server if needed.
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ", year, month, day, hour,
-                minute, second);
+  return FormatIso8601Offset(year, month, day, hour, minute, second, 0);
+}
+
+std::string FormatIso8601Offset(int year, int month, int day, int hour, int minute, int second,
+                                int offset_min) {
+  // Device wall-clock without TZ; apply configured offset (Vietnam default +07:00).
+  char buf[40];
+  char sign = offset_min >= 0 ? '+' : '-';
+  int abs_min = offset_min >= 0 ? offset_min : -offset_min;
+  int oh = abs_min / 60;
+  int om = abs_min % 60;
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d", year, month, day,
+                hour, minute, second, sign, oh, om);
   return buf;
 }
 
@@ -105,6 +118,23 @@ bool EnsureDir(const std::string& path, std::string& err) {
     return false;
   }
   return true;
+}
+
+std::string PrimaryLanIPv4() {
+  ifaddrs* ifaddr = nullptr;
+  if (getifaddrs(&ifaddr) != 0) return "";
+  std::string out;
+  for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+    if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+    char buf[INET_ADDRSTRLEN] = {};
+    auto* sin = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+    if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+    out = buf;
+    break;
+  }
+  freeifaddrs(ifaddr);
+  return out;
 }
 
 }  // namespace cg

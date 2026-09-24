@@ -14,12 +14,17 @@ base_url=https://your-host.example.com/api/v1
 data_dir=/var/lib/checkin-gateway
 
 agent_name=checkin-gateway
-agent_version=1.0.0
+agent_version=1.2.0
 
-live_listen=true
+# ATTLOG: gateway syncs twice daily at local 00:00 and 12:00 only,
+# filtering punches from attendance_devices.usage_started_on; skips if fingerprint unchanged.
+live_listen=false
 # Also pull ATTLOG periodically (covers missed live events after reconnect)
-poll_fallback=true
-poll_interval_sec=30
+poll_fallback=false
+# Pull attendance_devices (with IP) from server and poll each terminal
+discover_terminals=true
+catalog_refresh_sec=300
+poll_interval_sec=43200
 
 # false = send local ID + all available fields; true = only attendance_code + timestamp
 ingest_minimal=false

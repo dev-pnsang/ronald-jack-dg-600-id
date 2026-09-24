@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(checkin-gateway VERSION 1.0.0 LANGUAGES CXX)
+project(checkin-gateway VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,7 @@ add_executable(checkin-gateway
   src/ingest.cpp
   src/store.cpp
   src/gateway.cpp
+  src/probe.cpp
 )
 
 target_include_directories(checkin-gateway PRIVATE
@@ -36,5 +37,6 @@ target_link_libraries(checkin-gateway PRIVATE
 )
 
 install(TARGETS checkin-gateway RUNTIME DESTINATION bin)
+install(PROGRAMS scripts/checkin-gatewayctl DESTINATION sbin)
 install(FILES config/checkin-gateway.conf.example DESTINATION share/checkin-gateway)
 install(FILES systemd/checkin-gateway.service DESTINATION lib/systemd/system)

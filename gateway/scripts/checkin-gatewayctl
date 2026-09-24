@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Thin wrapper for operators / first-boot: set server domain, enroll, status.
+set -euo pipefail
+CONF="${CHECKIN_GATEWAY_CONF:-/etc/checkin-gateway/checkin-gateway.conf}"
+BIN="${CHECKIN_GATEWAY_BIN:-/usr/bin/checkin-gateway}"
+if [[ ! -x "$BIN" ]]; then
+  BIN=/usr/local/bin/checkin-gateway
+fi
+
+usage() {
+  cat <<EOF
+Usage: checkin-gatewayctl <command> [args]
+
+  set-server <url>     Set CommaDesk API base (e.g. https://host/api/v1)
+  set-device <ip> [port]  Set ZK terminal IP/port (default port 4370)
+  enroll <pairing>     Enroll Device Identity once
+  status               Show config + enrolled state
+  restart              systemctl restart checkin-gateway
+  enable               systemctl enable --now checkin-gateway
+
+Env: CHECKIN_GATEWAY_CONF, CHECKIN_GATEWAY_BIN
+EOF
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  set-server)
+    url="${1:?url required}"
+    "$BIN" --config "$CONF" server set --url "$url"
+    ;;
+  set-device)
+    host="${1:?ip required}"
+    port="${2:-4370}"
+    "$BIN" --config "$CONF" device set --host "$host" --port "$port"
+    ;;
+  enroll)
+    code="${1:?pairing code required}"
+    "$BIN" --config "$CONF" --enroll "$code"
+    ;;
+  status)
+    "$BIN" --config "$CONF" --status
+    systemctl is-active checkin-gateway 2>/dev/null || true
+    systemctl is-enabled checkin-gateway 2>/dev/null || true
+    ;;
+  restart)
+    systemctl restart checkin-gateway
+    ;;
+  enable)
+    systemctl enable --now checkin-gateway
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

@@ -6,6 +6,29 @@ Platform device role: **checkin gateway** (`device_type = gateway`). Agent does 
 
 Next-step plan: [`docs/checkin-gateway-next-plan.md`](../docs/checkin-gateway-next-plan.md)
 
+
+## Install from .deb (recommended)
+
+```bash
+./scripts/build-deb.sh
+sudo apt install -y ./dist/checkin-gateway_*_*.deb
+# or: sudo dpkg -i ./dist/checkin-gateway_*_*.deb
+```
+
+First boot / plug-and-run:
+
+```bash
+sudo checkin-gatewayctl set-server https://YOUR-HOST/api/v1
+# optional LAN terminal fallback if catalog empty:
+sudo checkin-gatewayctl set-device 192.168.2.96 4370
+sudo checkin-gatewayctl enroll 'cp_pair_....'
+sudo checkin-gatewayctl enable
+sudo checkin-gatewayctl status
+```
+
+Service uses `/etc/checkin-gateway/checkin-gateway.conf` and state in `/var/lib/checkin-gateway`.
+ATTLOG sync runs at local **00:00** and **12:00** only (from `usage_started_on`).
+
 ## Source of truth
 
 - `requirements/api-may-cham-cong-device-ingest.md`

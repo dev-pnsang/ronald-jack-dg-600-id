@@ -1,5 +1,6 @@
 #include "gateway.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -7,6 +8,7 @@
 #include <ctime>
 #include <fstream>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <sys/stat.h>
@@ -38,7 +40,7 @@ bool LooksLikeInvalidBody(const SignedResult& r) {
 bool IsRecentPunch(const AttendanceEvent& ev, int max_age_sec) {
   std::time_t now = std::time(nullptr);
   std::tm tmb{};
-  gmtime_r(&now, &tmb);
+  localtime_r(&now, &tmb);
   auto days = [](int y, int m, int d) -> int64_t {
     if (m < 3) {
       y -= 1;
@@ -55,16 +57,76 @@ bool IsRecentPunch(const AttendanceEvent& ev, int max_age_sec) {
   return delta <= max_age_sec;
 }
 
+
+std::string FingerprintEvents(const std::vector<AttendanceEvent>& logs) {
+  std::vector<std::string> keys;
+  keys.reserve(logs.size());
+  for (const auto& ev : logs) keys.push_back(DedupeKey(ev));
+  std::sort(keys.begin(), keys.end());
+  uint64_t h = 5381;
+  for (const auto& k : keys) {
+    for (unsigned char c : k) h = ((h << 5) + h) + c;
+  }
+  return std::to_string(keys.size()) + ":" + std::to_string(h);
+}
+
+// Fire only in the first 90 seconds of local 00:00 and 12:00 (once per slot key).
+std::string CurrentAttlogSyncSlot() {
+  std::time_t now = std::time(nullptr);
+  std::tm tmb{};
+  localtime_r(&now, &tmb);
+  if (tmb.tm_hour != 0 && tmb.tm_hour != 12) return "";
+  if (tmb.tm_min != 0) return "";
+  if (tmb.tm_sec > 90) return "";
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d-%02d", tmb.tm_year + 1900, tmb.tm_mon + 1,
+                tmb.tm_mday, tmb.tm_hour);
+  return buf;
+}
+
+bool PunchOnOrAfter(const AttendanceEvent& ev, const std::string& ymd) {
+  if (ymd.empty() || ymd.size() < 10) return true;
+  int y = 0, m = 0, d = 0;
+  if (std::sscanf(ymd.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return true;
+  if (ev.year != y) return ev.year > y;
+  if (ev.month != m) return ev.month > m;
+  return ev.day >= d;
+}
+
 void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const AttendanceEvent& ev) {
-  auto body = BuildIngestBody(ev, info, cfg);
-  auto key = DedupeKey(ev);
+  AttendanceEvent punch = ev;
+  if (punch.year < cfg.punch_min_year) {
+    std::time_t now = std::time(nullptr);
+    std::tm tmb{};
+    localtime_r(&now, &tmb);
+    punch.year = tmb.tm_year + 1900;
+    punch.month = tmb.tm_mon + 1;
+    punch.day = tmb.tm_mday;
+    punch.hour = tmb.tm_hour;
+    punch.minute = tmb.tm_min;
+    punch.second = tmb.tm_sec;
+    punch.timestamp_iso = FormatIso8601Offset(punch.year, punch.month, punch.day, punch.hour,
+                                              punch.minute, punch.second, cfg.device_tz_offset_min);
+    std::fprintf(stderr,
+                 "[punch] bad device clock (%s) — using gateway time %s user=%s\n",
+                 ev.timestamp_iso.c_str(), punch.timestamp_iso.c_str(), punch.user_id.c_str());
+  }
+  std::string body;
+  try {
+    body = BuildIngestBody(punch, info, cfg);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "[punch] skip bad body user=%s: %s\n", punch.user_id.c_str(), ex.what());
+    return;
+  }
+  auto key = DedupeKey(punch);
   std::string e2;
   if (!store.Enqueue(key, body, e2)) {
     std::fprintf(stderr, "[outbox] enqueue failed: %s\n", e2.c_str());
     return;
   }
-  std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", ev.user_id.c_str(),
-               ev.timestamp_iso.c_str(), ev.verify_mode, ev.inout_mode, ev.from_live ? 1 : 0);
+  std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
+               punch.timestamp_iso.c_str(), punch.verify_mode, punch.inout_mode,
+               punch.from_live ? 1 : 0);
 }
 
 void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Credential& cred) {
@@ -256,96 +318,224 @@ int RunGateway(const Config& cfg_in) {
   }
 
   HttpClient http(cfg.http_timeout_sec);
-  ZkDevice device;
-  DeviceInfo info;
-  info.ip = cfg.device_ip;
-  info.port = cfg.device_port;
 
-  int64_t last_poll = 0;
-  int64_t last_prune = 0;
+  struct TerminalTarget {
+    std::string id;
+    std::string name;
+    std::string ip;
+    int port = 4370;
+    std::string usage_started_on;  // YYYY-MM-DD inclusive
+  };
+
+  auto parse_catalog = [&](const std::string& body, std::vector<TerminalTarget>& out) {
+    out.clear();
+    try {
+      auto j = nlohmann::json::parse(body);
+      auto data = j.contains("data") ? j["data"] : j;
+      if (!data.is_array()) return;
+      for (const auto& row : data) {
+        TerminalTarget t;
+        t.id = row.value("id", "");
+        t.name = row.value("name", "");
+        t.ip = row.value("ip_address", "");
+        t.port = row.value("port", 4370);
+        t.usage_started_on = row.value("usage_started_on", "");
+        if (t.ip.empty()) continue;
+        if (t.port <= 0) t.port = 4370;
+        out.push_back(t);
+      }
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "[catalog] parse error: %s\n", ex.what());
+    }
+  };
+
+  auto refresh_catalog = [&](std::vector<TerminalTarget>& terminals) {
+    if (!cfg.discover_terminals) {
+      terminals.clear();
+      if (!cfg.device_ip.empty()) {
+        terminals.push_back(
+            TerminalTarget{"local", "config", cfg.device_ip, cfg.device_port, ""});
+      }
+      return;
+    }
+    auto r = SignedRequest(cfg, http, cred, "GET", "/checkin/terminals", "");
+    if (r.ok) {
+      parse_catalog(r.body, terminals);
+      std::fprintf(stderr, "[catalog] %zu terminal(s) from server\n", terminals.size());
+    } else {
+      std::fprintf(stderr, "[catalog] fetch fail: %s %s\n", r.error.c_str(),
+                   r.body.substr(0, 160).c_str());
+    }
+    if (terminals.empty() && !cfg.device_ip.empty()) {
+      terminals.push_back(
+          TerminalTarget{"local", "config-fallback", cfg.device_ip, cfg.device_port, ""});
+      std::fprintf(stderr, "[catalog] empty — fallback device_ip=%s:%d\n", cfg.device_ip.c_str(),
+                   cfg.device_port);
+    }
+  };
+
+  std::vector<TerminalTarget> terminals;
+  refresh_catalog(terminals);
+
+  {
+    std::string tip = cfg.device_ip;
+    int tport = cfg.device_port;
+    if (!terminals.empty()) {
+      tip = terminals[0].ip;
+      tport = terminals[0].port;
+    }
+    nlohmann::json hb = {
+        {"lan_ip", PrimaryLanIPv4()},
+        {"terminal_ip", tip},
+        {"terminal_port", tport},
+        {"hostname", Hostname()},
+        {"agent_name", cfg.agent_name},
+        {"agent_version", cfg.agent_version},
+        {"terminal_model", "Ronald Jack DG-600-ID"},
+    };
+    std::string raw = hb.dump();
+    auto hr = SignedRequest(cfg, http, cred, "PUT", "/device-identity/heartbeat", raw);
+    if (hr.ok) {
+      std::fprintf(stderr, "[heartbeat] ok status=%ld lan_ip=%s terminal_ip=%s\n", hr.status,
+                   hb.value("lan_ip", "").c_str(), tip.c_str());
+    } else {
+      std::fprintf(stderr, "[heartbeat] fail: %s %s\n", hr.error.c_str(),
+                   hr.body.substr(0, 200).c_str());
+    }
+  }
 
   std::fprintf(stderr,
-               "[gateway] start agent=%s version=%s base_url=%s device=%s:%d "
-               "ingest_minimal=%d poll_fallback=%d\n",
+               "[gateway] start agent=%s version=%s base_url=%s discover=%d terminals=%zu "
+               "attlog_sync=00:00+12:00 ingest_minimal=%d\n",
                cfg.agent_name.c_str(), cfg.agent_version.c_str(), cfg.base_url.c_str(),
-               cfg.device_ip.c_str(), cfg.device_port, cfg.ingest_minimal ? 1 : 0,
-               cfg.poll_fallback ? 1 : 0);
+               cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.ingest_minimal ? 1 : 0);
+
+  int64_t last_catalog = UnixNow();
+  int64_t last_prune = 0;
+  int64_t last_heartbeat = UnixNow();
+  std::string last_sync_slot;
+  {
+    std::string meta_err;
+    store.GetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
+  }
+  // Never sync on startup — only at local 00:00 and 12:00.
+
+  auto sync_terminal_attlog = [&](const TerminalTarget& t) {
+    ZkDevice device;
+    DeviceInfo info;
+    info.ip = t.ip;
+    info.port = t.port;
+    device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+    std::string local_err;
+    std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s\n", t.name.c_str(), t.id.c_str(),
+                 t.ip.c_str(), t.port,
+                 t.usage_started_on.empty() ? "(today/all)" : t.usage_started_on.c_str());
+    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+      std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+      return;
+    }
+    device.ReadDeviceInfo(info, local_err);
+    std::vector<AttendanceEvent> logs;
+    if (!device.ReadAttendanceLogs(logs, local_err)) {
+      std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(), local_err.c_str());
+      device.Disconnect();
+      return;
+    }
+    device.Disconnect();
+
+    std::string since = t.usage_started_on;
+    if (since.empty()) {
+      std::time_t tn = std::time(nullptr);
+      std::tm tmb{};
+      localtime_r(&tn, &tmb);
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmb.tm_year + 1900, tmb.tm_mon + 1,
+                    tmb.tm_mday);
+      since = buf;
+    }
+
+    std::vector<AttendanceEvent> filtered;
+    filtered.reserve(logs.size());
+    for (auto& ev : logs) {
+      if (ev.year < cfg.punch_min_year) continue;
+      if (!PunchOnOrAfter(ev, since)) continue;
+      filtered.push_back(std::move(ev));
+    }
+
+    std::string fp = FingerprintEvents(filtered);
+    std::string fp_key = "attlog_fp:" + (t.id.empty() ? t.ip : t.id);
+    std::string prev_fp;
+    std::string meta_err;
+    store.GetMeta(fp_key, prev_fp, meta_err);
+    if (!prev_fp.empty() && prev_fp == fp) {
+      std::fprintf(stderr, "[attlog] %s unchanged fp=%s (skip ingest)\n", t.ip.c_str(), fp.c_str());
+      return;
+    }
+
+    int enq = 0;
+    for (auto& ev : filtered) {
+      ev.from_live = false;
+      EnqueuePunch(store, cfg, info, ev);
+      ++enq;
+    }
+    store.SetMeta(fp_key, fp, meta_err);
+    std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d fp=%s\n", t.ip.c_str(),
+                 filtered.size(), logs.size(), enq, fp.c_str());
+  };
 
   while (g_running) {
-    if (!device.IsConnected()) {
-      std::fprintf(stderr, "[zk] connecting %s:%d ...\n", cfg.device_ip.c_str(), cfg.device_port);
-      if (!device.Connect(cfg.device_ip, cfg.device_port, cfg.device_password, cfg.device_timeout_sec,
-                          err)) {
-        std::fprintf(stderr, "[zk] connect failed: %s\n", err.c_str());
-        FlushOutbox(cfg, store, http, cred);
-        std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
-        continue;
-      }
-      if (device.ReadDeviceInfo(info, err)) {
-        std::fprintf(stderr, "[zk] connected serial=%s firmware=%s\n", info.serial.c_str(),
-                     info.firmware.c_str());
-      }
-      std::vector<UserRecord> users;
-      if (device.ReadUsers(users, err)) {
-        std::fprintf(stderr, "[zk] users cached: %zu\n", users.size());
-      }
-      if (cfg.live_listen) {
-        if (!device.StartLiveCapture(err)) {
-          std::fprintf(stderr, "[zk] StartLiveCapture failed: %s\n", err.c_str());
-          device.Disconnect();
-          std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
-          continue;
-        }
-        std::fprintf(stderr, "[zk] live listen ON\n");
-      }
-      // Bootstrap poll once after connect so we catch punches missed during downtime.
-      last_poll = 0;
-    }
-
-    if (cfg.live_listen) {
-      bool ok = device.PollLive(
-          [&](const AttendanceEvent& ev) { EnqueuePunch(store, cfg, info, ev); }, 500, err);
-      if (!ok) {
-        std::fprintf(stderr, "[zk] poll error: %s — reconnecting\n", err.c_str());
-        device.Disconnect();
-        std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
-        continue;
-      }
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
     int64_t now = UnixNow();
-    if (cfg.poll_fallback && device.IsConnected() &&
-        (last_poll == 0 || now - last_poll >= cfg.poll_interval_sec)) {
-      last_poll = now;
-      std::vector<AttendanceEvent> logs;
-      if (device.ReadAttendanceLogs(logs, err)) {
-        // Only recent punches — avoid replaying full history every interval.
-        // Live path remains primary; this covers missed RT events after reconnect.
-        constexpr int kRecentSec = 5 * 60;
-        int recent = 0;
-        for (auto& ev : logs) {
-          if (!IsRecentPunch(ev, kRecentSec)) continue;
-          EnqueuePunch(store, cfg, info, ev);
-          if (++recent >= 50) break;
-        }
-        if (recent > 0)
-          std::fprintf(stderr, "[zk] poll_fallback enqueued %d recent logs\n", recent);
-      } else {
-        std::fprintf(stderr, "[zk] ReadAttendanceLogs: %s\n", err.c_str());
+    if (cfg.discover_terminals &&
+        (now - last_catalog >= std::max(60, cfg.catalog_refresh_sec))) {
+      last_catalog = now;
+      refresh_catalog(terminals);
+    }
+
+    if (now - last_heartbeat >= 300) {
+      last_heartbeat = now;
+      std::string tip = terminals.empty() ? cfg.device_ip : terminals[0].ip;
+      int tport = terminals.empty() ? cfg.device_port : terminals[0].port;
+      nlohmann::json hb = {
+          {"lan_ip", PrimaryLanIPv4()},
+          {"terminal_ip", tip},
+          {"terminal_port", tport},
+          {"hostname", Hostname()},
+          {"agent_name", cfg.agent_name},
+          {"agent_version", cfg.agent_version},
+      };
+      auto hr = SignedRequest(cfg, http, cred, "PUT", "/device-identity/heartbeat", hb.dump());
+      if (!hr.ok) {
+        std::fprintf(stderr, "[heartbeat] fail: %s\n", hr.error.c_str());
       }
+    }
+
+    std::string slot = CurrentAttlogSyncSlot();
+    if (!slot.empty() && slot != last_sync_slot && !terminals.empty()) {
+      std::fprintf(stderr, "[attlog] scheduled sync slot=%s terminals=%zu\n", slot.c_str(),
+                   terminals.size());
+      for (const auto& t : terminals) {
+        if (!g_running) break;
+        sync_terminal_attlog(t);
+        FlushOutbox(cfg, store, http, cred);
+      }
+      last_sync_slot = slot;
+      std::string meta_err;
+      store.SetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
     }
 
     FlushOutbox(cfg, store, http, cred);
-
+    now = UnixNow();
     if (now - last_prune > 3600) {
       last_prune = now;
       MaybePrune(store, cfg);
     }
+    // Idle loop — no live listen / no frequent ATTLOG (locks ZK panel).
+    for (int i = 0; i < 30 && g_running; ++i) {
+      FlushOutbox(cfg, store, http, cred);
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
   }
 
-  device.Disconnect();
   std::fprintf(stderr, "[gateway] stopped\n");
   return 0;
 }

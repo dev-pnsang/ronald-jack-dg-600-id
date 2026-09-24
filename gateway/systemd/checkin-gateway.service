@@ -1,5 +1,6 @@
 [Unit]
 Description=CommaDesk Checkin Gateway (Ronald Jack DG-600-ID)
+Documentation=file:///usr/share/doc/checkin-gateway/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -7,10 +8,13 @@ Wants=network-online.target
 Type=simple
 User=checkin-gateway
 Group=checkin-gateway
-ExecStart=/usr/local/bin/checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf
+ExecStart=/usr/bin/checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --log-level info
 Restart=on-failure
 RestartSec=5
-# Secrets live under data_dir; do not expose in Environment=
+# Exit 2 = not enrolled yet — do not thrash restart
+RestartPreventExitStatus=2
+KillMode=mixed
+TimeoutStopSec=15
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
