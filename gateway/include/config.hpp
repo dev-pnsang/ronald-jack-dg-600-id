@@ -26,7 +26,7 @@ struct Config {
   std::string agent_version = "1.0.0";
 
   // Behavior
-  bool live_listen = false;
+  bool live_listen = true;
   bool poll_fallback = false;
   /** Pull org attendance_devices (with IP) from CommaDesk and poll each. */
   bool discover_terminals = true;

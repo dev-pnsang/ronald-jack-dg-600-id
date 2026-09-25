@@ -509,9 +509,53 @@ int RunGateway(const Config& cfg_in) {
 
   std::fprintf(stderr,
                "[gateway] start agent=%s version=%s base_url=%s discover=%d terminals=%zu "
-               "attlog_sync=00:00+12:00 ingest_minimal=%d\n",
+               "attlog_sync=00:00+12:00 live_listen=%d ingest_minimal=%d\n",
                cfg.agent_name.c_str(), cfg.agent_version.c_str(), cfg.base_url.c_str(),
-               cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.ingest_minimal ? 1 : 0);
+               cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.live_listen ? 1 : 0,
+               cfg.ingest_minimal ? 1 : 0);
+
+  // Sync device wall-clock from gateway local time on every service start (DG-600 often
+  // boots at 2000-01-01 after power loss).
+  auto sync_terminal_clock = [&](const TerminalTarget& t) {
+    std::string local_err;
+    ZkDevice device;
+    device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+      std::fprintf(stderr, "[time] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+      return;
+    }
+    DeviceTime before;
+    std::string before_s = "?";
+    if (device.GetTime(before, local_err)) {
+      before_s = before.iso_local;
+    }
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    if (!device.SetTime(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour,
+                        local.tm_min, local.tm_sec, local_err)) {
+      std::fprintf(stderr, "[time] SET_TIME fail %s: %s (was %s)\n", t.ip.c_str(),
+                   local_err.c_str(), before_s.c_str());
+      device.Disconnect();
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    DeviceTime after;
+    std::string after_s = "?";
+    if (device.GetTime(after, local_err)) after_s = after.iso_local;
+    device.Disconnect();
+    char server_buf[32];
+    std::snprintf(server_buf, sizeof(server_buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+                  local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour,
+                  local.tm_min, local.tm_sec);
+    std::fprintf(stderr, "[time] synced %s (%s) before=%s after=%s server=%s\n", t.ip.c_str(),
+                 t.name.c_str(), before_s.c_str(), after_s.c_str(), server_buf);
+  };
+
+  for (const auto& t : terminals) {
+    if (!g_running) break;
+    sync_terminal_clock(t);
+  }
 
   int64_t last_catalog = UnixNow();
   int64_t last_prune = 0;
@@ -521,7 +565,49 @@ int RunGateway(const Config& cfg_in) {
     std::string meta_err;
     store.GetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
   }
-  // Never sync on startup — only at local 00:00 and 12:00.
+  // Never sync ATTLOG on startup — only at local 00:00 and 12:00.
+
+  // Persistent RegEvent session on the primary terminal (realtime punches).
+  // Do NOT ReadUsers/ATTLOG on this socket — bulk breaks RegEvent on DG-600 until reconnect.
+  ZkDevice live_device;
+  live_device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+  DeviceInfo live_info;
+  std::string live_ip;
+  int live_port = 0;
+
+  auto ensure_live = [&]() -> bool {
+    if (!cfg.live_listen) return false;
+    if (terminals.empty()) {
+      std::fprintf(stderr, "[zk] live listen: no terminals\n");
+      return false;
+    }
+    const TerminalTarget& t = terminals[0];
+    if (live_device.IsConnected() && live_ip == t.ip && live_port == t.port) return true;
+
+    live_device.Disconnect();
+    live_ip = t.ip;
+    live_port = t.port;
+    live_info = DeviceInfo{};
+    live_info.ip = t.ip;
+    live_info.port = t.port;
+
+    std::string err;
+    std::fprintf(stderr, "[zk] live connecting %s:%d (%s) ...\n", t.ip.c_str(), t.port,
+                 t.name.c_str());
+    if (!live_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, err)) {
+      std::fprintf(stderr, "[zk] live connect failed: %s\n", err.c_str());
+      return false;
+    }
+    live_device.ReadDeviceInfo(live_info, err);
+    if (!live_device.StartLiveCapture(err)) {
+      std::fprintf(stderr, "[zk] StartLiveCapture failed: %s\n", err.c_str());
+      live_device.Disconnect();
+      return false;
+    }
+    std::fprintf(stderr, "[zk] live listen ON %s:%d serial=%s\n", t.ip.c_str(), t.port,
+                 live_info.serial.c_str());
+    return true;
+  };
 
   auto sync_terminal_attlog = [&](const TerminalTarget& t) {
     DeviceInfo info;
@@ -533,9 +619,14 @@ int RunGateway(const Config& cfg_in) {
                  t.ip.c_str(), t.port,
                  t.usage_started_on.empty() ? "(today/all)" : t.usage_started_on.c_str());
 
-    // --- Session A: ATTLOG only (buffered) ---
+    // One TCP session for reads only — disconnect ASAP. No RecoverDevice/Enable after bulk
+    // (that path froze the DG-600 panel when Enable timed out).
     std::vector<AttendanceEvent> logs;
     bool attlog_ok = false;
+    std::vector<UserRecord> users;
+    bool users_pulled = false;
+    int user_count = -1;
+
     {
       ZkDevice device;
       device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
@@ -543,71 +634,53 @@ int RunGateway(const Config& cfg_in) {
         std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
       } else {
         device.ReadDeviceInfo(info, local_err);
+
         if (!device.ReadAttendanceLogs(logs, local_err)) {
-          std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(), local_err.c_str());
+          std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(),
+                       local_err.c_str());
         } else {
           attlog_ok = true;
         }
-        std::string e_rec;
-        device.RecoverDevice(e_rec);
+
+        bool need_users = true;
+        DeviceInfo sizes_info;
+        RawBlob sizes_raw;
+        if (device.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
+          user_count = sizes_info.user_count;
+          std::string count_key = "users_count:" + tid;
+          std::string prev_count;
+          std::string meta_err;
+          store.GetMeta(count_key, prev_count, meta_err);
+          if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
+            std::string fp_key = "users_fp:" + tid;
+            std::string prev_fp;
+            store.GetMeta(fp_key, prev_fp, meta_err);
+            if (!prev_fp.empty()) {
+              need_users = false;
+              std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n", t.ip.c_str(),
+                           user_count);
+            }
+          }
+        }
+
+        if (need_users) {
+          if (!device.ReadUsers(users, local_err)) {
+            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+            users.clear();
+          } else {
+            users_pulled = true;
+            if (user_count < 0) user_count = static_cast<int>(users.size());
+          }
+        }
+
         device.Disconnect();
       }
     }
 
-    // --- Session B: USERTEMP only when free-sizes user count changed ---
-    {
-      bool need_users = true;
-      int user_count = -1;
-      {
-        ZkDevice probe;
-        probe.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-        if (probe.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
-          DeviceInfo sizes_info;
-          RawBlob sizes_raw;
-          if (probe.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
-            user_count = sizes_info.user_count;
-            std::string count_key = "users_count:" + tid;
-            std::string prev_count;
-            std::string meta_err;
-            store.GetMeta(count_key, prev_count, meta_err);
-            if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
-              // Count unchanged — still allow full re-sync if users_fp missing (first run).
-              std::string fp_key = "users_fp:" + tid;
-              std::string prev_fp;
-              store.GetMeta(fp_key, prev_fp, meta_err);
-              if (!prev_fp.empty()) {
-                need_users = false;
-                std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n", t.ip.c_str(),
-                             user_count);
-              }
-            }
-          }
-          std::string e_rec;
-          probe.RecoverDevice(e_rec);
-          probe.Disconnect();
-        }
-      }
-
-      if (need_users) {
-        ZkDevice device;
-        device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-        std::vector<UserRecord> users;
-        if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
-          std::fprintf(stderr, "[users] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
-        } else {
-          if (!device.ReadUsers(users, local_err)) {
-            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
-            users.clear();
-          }
-          std::string e_rec;
-          device.RecoverDevice(e_rec);
-          device.Disconnect();
-          SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
-          if (user_count < 0) user_count = static_cast<int>(users.size());
-          std::string meta_err;
-          store.SetMeta("users_count:" + tid, std::to_string(user_count), meta_err);
-        }
-      }
+    if (users_pulled) {
+      SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
+      std::string meta_err;
+      store.SetMeta("users_count:" + tid, std::to_string(user_count), meta_err);
     }
 
     std::string since = t.usage_started_on;
@@ -649,10 +722,10 @@ int RunGateway(const Config& cfg_in) {
     std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d fp=%s\n", t.ip.c_str(),
                  filtered.size(), logs.size(), enq, fp.c_str());
 
-    // Flush outbox before clearing device buffer so punches are durable locally.
+    // Durable locally before clearing device buffer.
     FlushOutbox(cfg, store, http, cred);
 
-    // Clear ATTLOG on device only after successful read + enqueue (keeps next slot fast).
+    // Light reconnect for CLEAR only (no bulk) — keeps next slot small.
     if (attlog_ok) {
       ZkDevice clearer;
       clearer.SetTzOffsetMinutes(cfg.device_tz_offset_min);
@@ -660,8 +733,6 @@ int RunGateway(const Config& cfg_in) {
         if (clearer.ClearAttendanceLogs(local_err)) {
           std::fprintf(stderr, "[attlog] %s cleared device ATTLOG after enqueue=%d\n", t.ip.c_str(),
                        enq);
-          // Empty fingerprint so next slot does not re-ingest stale filtered set from empty machine
-          // incorrectly — empty pull fingerprints to empty and skips; OK.
           store.SetMeta(fp_key, FingerprintEvents({}), meta_err);
         } else {
           std::fprintf(stderr, "[attlog] %s clear failed: %s\n", t.ip.c_str(), local_err.c_str());
@@ -699,6 +770,8 @@ int RunGateway(const Config& cfg_in) {
 
     std::string slot = CurrentAttlogSyncSlot();
     if (!slot.empty() && slot != last_sync_slot && !terminals.empty()) {
+      // Drop live session before bulk ATTLOG — RegEvent breaks after USERTEMP/ATTLOG on DG-600.
+      live_device.Disconnect();
       std::fprintf(stderr, "[attlog] scheduled sync slot=%s terminals=%zu\n", slot.c_str(),
                    terminals.size());
       for (const auto& t : terminals) {
@@ -717,13 +790,36 @@ int RunGateway(const Config& cfg_in) {
       last_prune = now;
       MaybePrune(store, cfg);
     }
-    // Idle loop — no live listen / no frequent ATTLOG (locks ZK panel).
-    for (int i = 0; i < 30 && g_running; ++i) {
+
+    if (cfg.live_listen) {
+      if (!ensure_live()) {
+        FlushOutbox(cfg, store, http, cred);
+        std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
+        continue;
+      }
+      std::string live_err;
+      bool ok = live_device.PollLive(
+          [&](const AttendanceEvent& ev) { EnqueuePunch(store, cfg, live_info, ev); }, 500,
+          live_err);
+      if (!ok) {
+        std::fprintf(stderr, "[zk] live poll error: %s — reconnecting\n", live_err.c_str());
+        live_device.Disconnect();
+        FlushOutbox(cfg, store, http, cred);
+        std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
+        continue;
+      }
+      // Flush shortly after punches so ingest is near-realtime.
       FlushOutbox(cfg, store, http, cred);
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+    } else {
+      // Idle — ATTLOG slots only (no realtime).
+      for (int i = 0; i < 30 && g_running; ++i) {
+        FlushOutbox(cfg, store, http, cred);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
     }
   }
 
+  live_device.Disconnect();
   std::fprintf(stderr, "[gateway] stopped\n");
   return 0;
 }

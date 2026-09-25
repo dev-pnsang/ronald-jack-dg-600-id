@@ -98,7 +98,8 @@ class ZkDevice {
   bool ReadAttendanceLogs(std::vector<AttendanceEvent>& out, std::string& err);
   bool ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob& raw, std::string& err);
 
-  // Re-enable UI after bulk (retry Enable, then hard reconnect). Call after every large pull.
+  // Soft EnableDevice only (short timeout). Prefer Disconnect after bulk — do not call
+  // RecoverDevice on the success path (Enable after large ATTLOG times out and freezes UI).
   bool RecoverDevice(std::string& err);
   // Clear attendance buffer on device after successful local enqueue (keeps next pull small).
   bool ClearAttendanceLogs(std::string& err);
@@ -133,7 +134,7 @@ class ZkDevice {
   void CloseSocket();
   bool Handshake(std::string& err);
   bool Authenticate(int password, std::string& err);
-  bool EnableDevice(bool enable, std::string& err);
+  bool EnableDevice(bool enable, std::string& err, int timeout_ms = 5000);
   bool GetString(uint16_t command, const std::string& param, std::string& value, std::string& err);
   bool ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& ev);
   bool FetchLargeData(uint16_t command, const std::vector<uint8_t>& req, RawBlob& raw,

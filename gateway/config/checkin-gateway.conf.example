@@ -18,7 +18,7 @@ agent_version=1.2.0
 
 # ATTLOG: gateway syncs twice daily at local 00:00 and 12:00 only,
 # filtering punches from attendance_devices.usage_started_on; skips if fingerprint unchanged.
-live_listen=false
+live_listen=true
 # Also pull ATTLOG periodically (covers missed live events after reconnect)
 poll_fallback=false
 # Pull attendance_devices (with IP) from server and poll each terminal

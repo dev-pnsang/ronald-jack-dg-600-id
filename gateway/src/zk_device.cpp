@@ -448,40 +448,26 @@ bool ZkDevice::Authenticate(int password, std::string& err) {
   return true;
 }
 
-bool ZkDevice::EnableDevice(bool enable, std::string& err) {
+bool ZkDevice::EnableDevice(bool enable, std::string& err, int timeout_ms) {
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
-  return SendCommand(enable ? CMD_ENABLEDEVICE : CMD_DISABLEDEVICE, {}, reply, cmd, err);
+  return SendCommand(enable ? CMD_ENABLEDEVICE : CMD_DISABLEDEVICE, {}, reply, cmd, err,
+                     timeout_ms > 0 ? timeout_ms : 5000);
 }
 
 bool ZkDevice::RecoverDevice(std::string& err) {
-  for (int i = 0; i < 3; ++i) {
-    std::string e;
-    if (EnableDevice(true, e)) {
-      err.clear();
-      return true;
-    }
-    err = e;
-    LogWarning("EnableDevice retry " + std::to_string(i + 1) + ": " + e);
-    ::usleep(200000u * static_cast<unsigned>(i + 1));
-  }
-  const std::string ip = ip_;
-  const int port = port_;
-  const int pw = password_;
-  const int to = timeout_sec_;
-  LogWarning("RecoverDevice: hard reconnect " + ip + ":" + std::to_string(port));
-  Disconnect();
-  std::string e2;
-  if (!Connect(ip, port, pw, to, e2)) {
-    err = "reconnect after bulk failed: " + e2;
+  // Soft enable only. Bulk pulls no longer call DisableDevice; hammering Enable + hard
+  // reconnect after ATTLOG/USERTEMP is what freezes the panel (Enable times out 5–10s).
+  if (!connected_) {
+    err = "not connected";
     return false;
   }
-  if (!EnableDevice(true, e2)) {
-    err = "enable after reconnect failed: " + e2;
-    return false;
+  if (EnableDevice(true, err, 1500)) {
+    err.clear();
+    return true;
   }
-  err.clear();
-  return true;
+  LogWarning("RecoverDevice soft Enable failed (ignored): " + err);
+  return false;
 }
 
 bool ZkDevice::ClearAttendanceLogs(std::string& err) {
@@ -489,20 +475,18 @@ bool ZkDevice::ClearAttendanceLogs(std::string& err) {
     err = "not connected";
     return false;
   }
-  // pyzk clear_attendance sends CMD_CLEAR_ATTLOG without DisableDevice.
+  // pyzk clear_attendance sends CMD_CLEAR_ATTLOG without DisableDevice / RecoverDevice.
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
   bool ok = SendCommand(CMD_CLEAR_ATTLOG, {}, reply, cmd, err, 10000);
   if (ok) {
     std::string e_ref;
     uint16_t rcmd = 0;
-    SendCommand(CMD_REFRESHDATA, {}, reply, rcmd, e_ref, 5000);
+    SendCommand(CMD_REFRESHDATA, {}, reply, rcmd, e_ref, 3000);
     LogInfo("ClearAttendanceLogs ok");
   } else {
     LogWarning("ClearAttendanceLogs failed: " + err);
   }
-  std::string e_rec;
-  RecoverDevice(e_rec);
   return ok;
 }
 
@@ -590,7 +574,7 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
     return false;
   }
   std::string e2;
-  EnableDevice(true, e2);  // best-effort
+  EnableDevice(true, e2, 2000);  // best-effort, short timeout — do not block panel
   connected_ = true;
   info_.ip = ip_;
   info_.port = port_;
@@ -741,7 +725,8 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
   raw = RawBlob{};
   raw.label = "cmd_" + std::to_string(command);
   const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 120000);
-  // No DisableDevice — same rationale as FetchLargeDataBuffered / pyzk.
+  // No DisableDevice / RecoverDevice — same as pyzk. Post-bulk Enable was timing out and
+  // freezing the panel; Disconnect (CMD_EXIT) is enough to release the device.
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
   LogInfo("Bulk request cmd=" + std::to_string(command) + " timeout_ms=" +
@@ -751,8 +736,6 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
     raw.status = "FAILED";
     raw.error = err;
     raw.reply_cmd = cmd;
-    std::string e_rec;
-    RecoverDevice(e_rec);
     return false;
   }
   raw.reply_cmd = cmd;
@@ -768,8 +751,6 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
         raw.status = "FAILED";
         raw.error = err + " (got " + std::to_string(blob.size()) + "/" + std::to_string(size) + ")";
         raw.bytes = blob;
-        std::string e_rec;
-        RecoverDevice(e_rec);
         return false;
       }
       if (c == CMD_DATA) {
@@ -787,22 +768,15 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
     }
     std::vector<uint8_t> freply;
     uint16_t fcmd = 0;
-    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, err, 5000);
+    std::string e_free;
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
   } else if (cmd == CMD_DATA || cmd == CMD_ACK_OK) {
     blob = reply;
   } else {
     raw.status = "FAILED";
     raw.error = "unexpected reply_cmd=" + std::to_string(cmd);
     raw.bytes = reply;
-    std::string e2;
-    RecoverDevice(e2);
     return false;
-  }
-  {
-    std::string e_en;
-    if (!RecoverDevice(e_en)) {
-      LogWarning("RecoverDevice after bulk failed: " + e_en);
-    }
   }
   raw.bytes = std::move(blob);
   raw.status = raw.bytes.empty() ? "empty" : "ok";
@@ -816,9 +790,9 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
   raw = RawBlob{};
   raw.label = "buf_cmd_" + std::to_string(command);
   const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 180000);
-  // IMPORTANT: Do NOT DisableDevice here.
+  // IMPORTANT: Do NOT DisableDevice / RecoverDevice here.
   // Dg600ReaderPy/pyzk read_with_buffer pulls USERTEMP/ATTLOG without disabling;
-  // DisableDevice is what freezes the panel on "Đang xử lý" when Enable fails after bulk.
+  // EnableDevice after bulk was freezing the panel when it timed out.
 
   // pyzk: pack('<bhii', 1, command, fct, ext)
   std::vector<uint8_t> prep;
@@ -841,8 +815,6 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
     raw.status = "FAILED";
     raw.error = err;
     raw.reply_cmd = cmd;
-    std::string e_rec;
-    RecoverDevice(e_rec);
     return false;
   }
   raw.reply_cmd = cmd;
@@ -855,8 +827,6 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
     if (reply.size() < 5) {
       raw.status = "FAILED";
       raw.error = "PREPARE_BUFFER short reply len=" + std::to_string(reply.size());
-      std::string e_rec;
-      RecoverDevice(e_rec);
       return false;
     }
     uint32_t size = ReadU32(reply.data() + 1);
@@ -866,12 +836,11 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
     } else if (size > 64u * 1024u * 1024u) {
       raw.status = "FAILED";
       raw.error = "PREPARE_BUFFER size too large: " + std::to_string(size);
-      std::string e_rec;
-      RecoverDevice(e_rec);
       return false;
     } else {
       blob.reserve(size);
       uint32_t start = 0;
+      bool first_chunk = true;
       while (start < size) {
         uint32_t need = size - start;
         if (need > BUF_MAX_CHUNK) need = BUF_MAX_CHUNK;
@@ -880,14 +849,14 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
         WriteU32(req, need);
         bool got = false;
         std::string last_err;
+        std::vector<uint8_t> creply;
         for (int attempt = 0; attempt < 3; ++attempt) {
-          std::vector<uint8_t> creply;
+          creply.clear();
           uint16_t ccmd = 0;
           if (!SendCommand(CMD_READ_BUFFER, req, creply, ccmd, last_err, bulk_timeout_ms)) {
             continue;
           }
           if (ccmd == CMD_DATA || ccmd == CMD_ACK_OK || ccmd == CMD_ACK_DATA) {
-            blob.insert(blob.end(), creply.begin(), creply.end());
             got = true;
             break;
           }
@@ -897,12 +866,30 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
           raw.status = "FAILED";
           raw.error = last_err + " at offset " + std::to_string(start);
           raw.bytes = blob;
-          std::string e_rec;
-          RecoverDevice(e_rec);
           return false;
         }
-        start += need;
-        if (start == need || start % (BUF_MAX_CHUNK * 2) < need) {
+        if (creply.empty()) {
+          // Some firmwares end early with empty DATA; accept what we have.
+          break;
+        }
+        // DG-600 often returns ~1KiB per READ_BUFFER. Advancing by requested `need`
+        // (pyzk uses start = len(buffer)) skipped most of the table and falsely "succeeded".
+        // Tiny chunks on a large buffer also mean hundreds of RTTs → panel lag; abort to stream.
+        if (first_chunk && creply.size() < 4096 && size > 16u * 1024u) {
+          std::vector<uint8_t> freply;
+          uint16_t fcmd = 0;
+          std::string e_free;
+          SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
+          raw.status = "FAILED";
+          raw.error = "buffered chunks too small (" + std::to_string(creply.size()) +
+                      "B); prefer stream";
+          LogWarning(raw.error);
+          return false;
+        }
+        first_chunk = false;
+        blob.insert(blob.end(), creply.begin(), creply.end());
+        start += static_cast<uint32_t>(creply.size());
+        if (blob.size() <= creply.size() || blob.size() % (64u * 1024u) < creply.size()) {
           LogInfo("buffer progress " + std::to_string(blob.size()) + "/" + std::to_string(size));
         }
       }
@@ -910,15 +897,9 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
     std::vector<uint8_t> freply;
     uint16_t fcmd = 0;
     std::string e_free;
-    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 5000);
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
   }
 
-  {
-    std::string e_rec;
-    if (!RecoverDevice(e_rec)) {
-      LogWarning("RecoverDevice after buffer failed: " + e_rec);
-    }
-  }
   raw.bytes = std::move(blob);
   raw.status = raw.bytes.empty() ? "empty" : "ok";
   LogInfo("Buffered done cmd=" + std::to_string(command) + " bytes=" +
@@ -928,11 +909,42 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
 
 bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,
                                    RawBlob& raw, std::string& err) {
+  auto reconnect = [&](std::string& e) -> bool {
+    const std::string ip = ip_;
+    const int port = port_;
+    const int pw = password_;
+    const int to = timeout_sec_;
+    Disconnect();
+    if (!Connect(ip, port, pw, to, e)) {
+      e = "reconnect before fallback: " + e;
+      return false;
+    }
+    return true;
+  };
+
+  // DG-600 READ_BUFFER often returns ~1KiB chunks. For large ATTLOG that means hundreds of
+  // RTTs (panel lag). Prefer continuous PREPARE_DATA stream for attendance.
+  if (command == CMD_ATTLOG_RRQ) {
+    if (FetchLargeData(command, legacy_req, raw, err)) return true;
+    LogWarning("stream attlog failed, try buffered: " + err);
+    std::string e_re;
+    if (!reconnect(e_re)) {
+      err = e_re;
+      return false;
+    }
+    return FetchLargeDataBuffered(command, fct, 0, raw, err);
+  }
+
   std::string buf_err;
   if (FetchLargeDataBuffered(command, fct, 0, raw, buf_err)) {
     return true;
   }
   LogWarning("buffered read failed, fallback stream: " + buf_err);
+  std::string e_re;
+  if (!reconnect(e_re)) {
+    err = e_re;
+    return false;
+  }
   return FetchLargeData(command, legacy_req, raw, err);
 }
 
