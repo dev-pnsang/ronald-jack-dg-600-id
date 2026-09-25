@@ -80,7 +80,7 @@ sudo checkin-gatewayctl status
 
 Kỳ vọng: `enrolled=true`, cả `checkin-gateway` và `checkin-ota` đều `active` / `enabled`.
 
-Từ **1.2.8**, enroll (chạy root) tự `chown` `state.db` sang user `checkin-gateway` — tránh lỗi `store: unable to open database file`.
+Từ **1.2.7+**, enroll (chạy root) tự `chown` `state.db` sang user `checkin-gateway` — tránh lỗi `store: unable to open database file`. Từ **1.2.8**, OTA `.deb` giữ conf local (không hỏi Y/N).
 
 ### Nâng cấp (máy đã enroll)
 
