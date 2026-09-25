@@ -33,7 +33,7 @@
 
 ### P2 — Vận hành
 
-9. `scripts/install.sh` + `systemctl enable --now`
+9. `scripts/install.sh` + `systemctl enable --now` — **đã có** `.deb` + `checkin-gatewayctl` (xem [`checkin-gateway-build-deb.md`](./checkin-gateway-build-deb.md))
 10. NTP host ±5 phút
 11. Runbook ngắn: đổi IP máy / đổi `base_url` / rotate
 

@@ -4,15 +4,20 @@ Linux background agent: listen attendance punches from **Ronald Jack DG-600-ID**
 
 Platform device role: **checkin gateway** (`device_type = gateway`). Agent does **not** set scopes — admin grants **GET / POST / PUT** on the CommaDesk Device Identity.
 
-Next-step plan: [`docs/checkin-gateway-next-plan.md`](../docs/checkin-gateway-next-plan.md)
+Next-step plan: [`docs/checkin-gateway-next-plan.md`](../docs/checkin-gateway-next-plan.md)  
+**Build `.deb` (arm64 / 1.2.7):** [`docs/checkin-gateway-build-deb.md`](../docs/checkin-gateway-build-deb.md)
 
 
 ## Install from .deb (recommended)
 
+Hướng dẫn đầy đủ (deps, arch, upgrade, OTA): [`docs/checkin-gateway-build-deb.md`](../docs/checkin-gateway-build-deb.md).
+
 ```bash
+cd gateway
+export CHECKIN_GATEWAY_VERSION=1.2.7   # optional; default in script
 ./scripts/build-deb.sh
-sudo apt install -y ./dist/checkin-gateway_*_*.deb
-# or: sudo dpkg -i ./dist/checkin-gateway_*_*.deb
+sudo dpkg -i ./dist/checkin-gateway_1.2.7_arm64.deb
+# or: sudo apt install -y ./dist/checkin-gateway_*_*.deb
 ```
 
 First boot / plug-and-run:
