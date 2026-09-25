@@ -37,6 +37,17 @@ case "$cmd" in
   enroll)
     code="${1:?pairing code required}"
     "$BIN" --config "$CONF" --enroll "$code"
+    # Enroll is usually run as root; systemd unit runs as user checkin-gateway.
+    # Without this, state.db stays root:root → "store: unable to open database file".
+    data_dir="$(awk -F= '/^data_dir=/{print $2; exit}' "$CONF" 2>/dev/null || true)"
+    data_dir="${data_dir:-/var/lib/checkin-gateway}"
+    if id checkin-gateway >/dev/null 2>&1; then
+      chown -R checkin-gateway:checkin-gateway "$data_dir" || true
+      chmod 750 "$data_dir" || true
+      chmod 640 "$data_dir"/state.db 2>/dev/null || true
+      chmod 640 "$data_dir"/state.db-wal 2>/dev/null || true
+      chmod 640 "$data_dir"/state.db-shm 2>/dev/null || true
+    fi
     ;;
   status)
     "$BIN" --config "$CONF" --status

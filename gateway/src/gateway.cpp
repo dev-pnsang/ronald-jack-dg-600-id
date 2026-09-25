@@ -12,7 +12,9 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <pwd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "device_identity.hpp"
 #include "http_client.hpp"
@@ -397,6 +399,21 @@ void HardenDataDir(const Config& cfg) {
   if (!cfg.config_path.empty()) ::chmod(cfg.config_path.c_str(), 0640);
 }
 
+// When enroll runs as root, hand ownership to the systemd service user so
+// checkin-gateway.service (User=checkin-gateway) can open state.db.
+void EnsureServiceDataOwnership(const Config& cfg) {
+  if (::geteuid() != 0) return;
+  struct passwd* pw = ::getpwnam("checkin-gateway");
+  if (!pw) return;
+  const uid_t uid = pw->pw_uid;
+  const gid_t gid = pw->pw_gid;
+  ::chown(cfg.data_dir.c_str(), uid, gid);
+  const std::string db = cfg.data_dir + "/state.db";
+  ::chown(db.c_str(), uid, gid);
+  ::chown((db + "-wal").c_str(), uid, gid);
+  ::chown((db + "-shm").c_str(), uid, gid);
+}
+
 }  // namespace
 
 int RunEnroll(const Config& cfg, const std::string& pairing_code) {
@@ -422,6 +439,7 @@ int RunEnroll(const Config& cfg, const std::string& pairing_code) {
     return 1;
   }
   HardenDataDir(cfg);
+  EnsureServiceDataOwnership(cfg);
   std::fprintf(stdout, "Enrolled OK.\n");
   std::fprintf(stdout, "  device_id: %s\n", cred.device_id.c_str());
   std::fprintf(stdout, "  organization_id: %s\n", cred.organization_id.c_str());
