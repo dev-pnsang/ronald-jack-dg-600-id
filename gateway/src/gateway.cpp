@@ -254,6 +254,14 @@ bool PunchOnOrAfter(const AttendanceEvent& ev, const std::string& ymd) {
   return ev.day >= d;
 }
 
+// Ship short Vietnamese ops messages to CommaDesk Device Monitor (POST /device-ops/logs).
+// Keep codes stable (English snake_case); put human text in `message`.
+void OpsLog(Store& store, const char* level, const char* component, const char* code,
+            const std::string& message, const nlohmann::json& fields = nlohmann::json::object()) {
+  std::string oe;
+  store.EnqueueOpsLog(level, component, code, message, fields.dump(), oe);
+}
+
 void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const AttendanceEvent& ev) {
   AttendanceEvent punch = ev;
   if (punch.year < cfg.punch_min_year) {
@@ -285,12 +293,9 @@ void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const
     std::fprintf(stderr, "[outbox] enqueue failed: %s\n", e2.c_str());
     return;
   }
-  {
-  std::string oe;
-  store.EnqueueOpsLog("info", "gateway", "punch", "punch captured",
-    std::string("{\"user\":\"") + punch.user_id + "\"}", oe);
-}
-std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
+  OpsLog(store, "info", "gateway", "punch", "Đã nhận chấm công từ máy",
+         {{"user", punch.user_id}, {"live", punch.from_live ? 1 : 0}});
+  std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
                punch.timestamp_iso.c_str(), punch.verify_mode, punch.inout_mode,
                punch.from_live ? 1 : 0);
 }
@@ -330,10 +335,8 @@ void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Creden
 
     if (r.ok && r.status == 201) {
       store.MarkOutboxOk(item.id, err);
-      {
-        std::string oe;
-        store.EnqueueOpsLog("info", "ingest", "ingest_ok", "punch accepted", "{}", oe);
-      }
+      OpsLog(store, "info", "ingest", "ingest_ok", "Server đã chấp nhận chấm công",
+             {{"outbox_id", item.id}});
       std::fprintf(stderr, "[ingest] ok id=%lld status=%ld\n", static_cast<long long>(item.id),
                    r.status);
     } else {
@@ -342,11 +345,21 @@ void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Creden
       int next_attempts = item.attempts + 1;
       if (next_attempts >= cfg.outbox_max_attempts) {
         store.AbandonOutbox(item.id, "max attempts: " + detail, err);
+        OpsLog(store, "error", "ingest", "ingest_abandon",
+               "Bỏ qua chấm công sau nhiều lần gửi thất bại",
+               {{"outbox_id", item.id}, {"attempts", next_attempts},
+                {"detail", detail.substr(0, 160)}});
         std::fprintf(stderr, "[ingest] abandon id=%lld after %d attempts: %s\n",
                      static_cast<long long>(item.id), next_attempts, detail.c_str());
       } else {
         int64_t next = UnixNow() + cfg.outbox_retry_sec;
         store.MarkOutboxFail(item.id, detail, next, err);
+        // Only first failure + every 5th retry — avoid flooding Device Monitor.
+        if (next_attempts == 1 || next_attempts % 5 == 0) {
+          OpsLog(store, "warn", "ingest", "ingest_fail", "Gửi chấm công lên server thất bại",
+                 {{"outbox_id", item.id}, {"attempt", next_attempts},
+                  {"detail", detail.substr(0, 160)}});
+        }
         std::fprintf(stderr, "[ingest] fail id=%lld attempt=%d: %s\n",
                      static_cast<long long>(item.id), next_attempts, detail.c_str());
       }
@@ -656,18 +669,77 @@ int RunGateway(const Config& cfg_in) {
       return;
     }
     auto r = SignedRequest(cfg, http, cred, "GET", "/checkin/terminals", "");
+    bool from_server = false;
     if (r.ok) {
       parse_catalog(r.body, terminals);
+      from_server = true;
       std::fprintf(stderr, "[catalog] %zu terminal(s) from server\n", terminals.size());
     } else {
       std::fprintf(stderr, "[catalog] fetch fail: %s %s\n", r.error.c_str(),
                    r.body.substr(0, 160).c_str());
+      static int64_t last_catalog_fail_ops = 0;
+      const int64_t now_cf = UnixNow();
+      if (now_cf - last_catalog_fail_ops >= 300) {
+        OpsLog(store, "warn", "catalog", "catalog_fetch_fail",
+               "Không lấy được danh sách thiết bị chấm công từ server",
+               {{"detail", (r.error + " " + r.body.substr(0, 120)).substr(0, 160)}});
+        last_catalog_fail_ops = now_cf;
+      }
     }
+
+    bool used_fallback = false;
     if (terminals.empty() && !cfg.device_ip.empty()) {
       terminals.push_back(
           TerminalTarget{"local", "config-fallback", cfg.device_ip, cfg.device_port, ""});
+      used_fallback = true;
       std::fprintf(stderr, "[catalog] empty — fallback device_ip=%s:%d\n", cfg.device_ip.c_str(),
                    cfg.device_port);
+    }
+
+    // Ops notify when catalog changes (not every refresh) — helps verify server/local match.
+    if (from_server || used_fallback) {
+      std::ostringstream fp_ss;
+      fp_ss << (from_server ? "srv:" : "fb:") << terminals.size();
+      int matched = 0;
+      nlohmann::json list = nlohmann::json::array();
+      for (const auto& t : terminals) {
+        fp_ss << "|" << t.id << "@" << t.ip << ":" << t.port;
+        bool same_cfg = (!cfg.device_ip.empty() && t.ip == cfg.device_ip && t.port == cfg.device_port);
+        if (same_cfg) ++matched;
+        list.push_back({{"id", t.id},
+                        {"name", t.name},
+                        {"ip", t.ip},
+                        {"port", t.port},
+                        {"matches_local_config", same_cfg}});
+      }
+      fp_ss << "|local=" << cfg.device_ip << ":" << cfg.device_port << "|m=" << matched;
+      const std::string fp = fp_ss.str();
+      std::string prev_fp;
+      std::string meta_err;
+      store.GetMeta("ops_catalog_fp", prev_fp, meta_err);
+      if (prev_fp != fp) {
+        store.SetMeta("ops_catalog_fp", fp, meta_err);
+        nlohmann::json fields = {{"count", terminals.size()},
+                                 {"local_ip", cfg.device_ip},
+                                 {"local_port", cfg.device_port},
+                                 {"matched_local_config", matched},
+                                 {"terminals", list}};
+        if (used_fallback) {
+          OpsLog(store, "warn", "catalog", "terminal_fallback",
+                 "Server chưa có thiết bị chấm công phù hợp — dùng cấu hình local", fields);
+        } else if (matched > 0) {
+          OpsLog(store, "info", "catalog", "terminal_matched",
+                 "Đã phát hiện thiết bị chấm công trên server trùng cấu hình local (IP/port)",
+                 fields);
+        } else if (!terminals.empty()) {
+          OpsLog(store, "info", "catalog", "terminal_found",
+                 "Đã lấy danh sách thiết bị chấm công từ server (khác IP/port cấu hình local)",
+                 fields);
+        } else {
+          OpsLog(store, "warn", "catalog", "terminal_empty",
+                 "Server trả về catalog thiết bị chấm công rỗng", fields);
+        }
+      }
     }
   };
 
@@ -718,6 +790,10 @@ int RunGateway(const Config& cfg_in) {
     device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
     if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
       std::fprintf(stderr, "[time] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+      OpsLog(store, "warn", "zk", "connect_fail",
+             "Không kết nối được máy chấm công khi đồng bộ giờ",
+             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+              {"phase", "sync_time"}});
       return;
     }
     DeviceTime before;
@@ -732,6 +808,10 @@ int RunGateway(const Config& cfg_in) {
                         local.tm_min, local.tm_sec, local_err)) {
       std::fprintf(stderr, "[time] SET_TIME fail %s: %s (was %s)\n", t.ip.c_str(),
                    local_err.c_str(), before_s.c_str());
+      OpsLog(store, "warn", "zk", "set_time_fail",
+             "Kết nối được máy nhưng đồng bộ giờ thất bại",
+             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+              {"before", before_s}});
       device.Disconnect();
       return;
     }
@@ -746,6 +826,15 @@ int RunGateway(const Config& cfg_in) {
                   local.tm_min, local.tm_sec);
     std::fprintf(stderr, "[time] synced %s (%s) before=%s after=%s server=%s\n", t.ip.c_str(),
                  t.name.c_str(), before_s.c_str(), after_s.c_str(), server_buf);
+    OpsLog(store, "info", "zk", "connect_ok",
+           "Đã kết nối máy chấm công và đồng bộ giờ thành công",
+           {{"ip", t.ip},
+            {"port", t.port},
+            {"name", t.name},
+            {"before", before_s},
+            {"after", after_s},
+            {"gateway_time", server_buf},
+            {"phase", "sync_time"}});
   };
 
   for (const auto& t : terminals) {
@@ -771,6 +860,8 @@ int RunGateway(const Config& cfg_in) {
   DeviceInfo live_info;
   std::string live_ip;
   int live_port = 0;
+  bool live_ops_ok = false;
+  int64_t last_live_fail_ops = 0;
 
   auto ensure_live = [&]() -> bool {
     if (!cfg.live_listen) return false;
@@ -791,18 +882,42 @@ int RunGateway(const Config& cfg_in) {
     std::string err;
     std::fprintf(stderr, "[zk] live connecting %s:%d (%s) ...\n", t.ip.c_str(), t.port,
                  t.name.c_str());
+    auto log_live_fail = [&](const char* code, const std::string& msg) {
+      const int64_t now = UnixNow();
+      // State change or at most every 5 minutes while still down.
+      if (live_ops_ok || now - last_live_fail_ops >= 300) {
+        OpsLog(store, "warn", "zk", code, msg,
+               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", err},
+                {"phase", "live_listen"}});
+        last_live_fail_ops = now;
+      }
+      live_ops_ok = false;
+    };
     if (!live_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, err)) {
       std::fprintf(stderr, "[zk] live connect failed: %s\n", err.c_str());
+      log_live_fail("connect_fail", "Không kết nối được máy chấm công (lắng nghe realtime)");
       return false;
     }
     live_device.ReadDeviceInfo(live_info, err);
     if (!live_device.StartLiveCapture(err)) {
       std::fprintf(stderr, "[zk] StartLiveCapture failed: %s\n", err.c_str());
       live_device.Disconnect();
+      log_live_fail("live_capture_fail",
+                    "Kết nối được máy nhưng không bật được lắng nghe realtime");
       return false;
     }
     std::fprintf(stderr, "[zk] live listen ON %s:%d serial=%s\n", t.ip.c_str(), t.port,
                  live_info.serial.c_str());
+    if (!live_ops_ok) {
+      OpsLog(store, "info", "zk", "connect_ok",
+             "Đã kết nối máy chấm công và bật lắng nghe realtime",
+             {{"ip", t.ip},
+              {"port", t.port},
+              {"name", t.name},
+              {"serial", live_info.serial},
+              {"phase", "live_listen"}});
+    }
+    live_ops_ok = true;
     return true;
   };
 
@@ -829,6 +944,10 @@ int RunGateway(const Config& cfg_in) {
       device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
       if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
         std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+        OpsLog(store, "warn", "zk", "connect_fail",
+               "Không kết nối được máy chấm công khi đồng bộ ATTLOG",
+               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+                {"phase", "attlog_sync"}});
       } else {
         device.ReadDeviceInfo(info, local_err);
 
@@ -1006,6 +1125,14 @@ int RunGateway(const Config& cfg_in) {
       if (!ok) {
         std::fprintf(stderr, "[zk] live poll error: %s — reconnecting\n", live_err.c_str());
         live_device.Disconnect();
+        const int64_t now_disc = UnixNow();
+        if (live_ops_ok || now_disc - last_live_fail_ops >= 300) {
+          OpsLog(store, "warn", "zk", "live_disconnect",
+                 "Mất kết nối máy chấm công khi lắng nghe realtime — đang kết nối lại",
+                 {{"ip", live_ip}, {"port", live_port}, {"detail", live_err}});
+          last_live_fail_ops = now_disc;
+        }
+        live_ops_ok = false;
         FlushOutbox(cfg, store, http, cred);
         std::this_thread::sleep_for(std::chrono::seconds(cfg.reconnect_delay_sec));
         continue;

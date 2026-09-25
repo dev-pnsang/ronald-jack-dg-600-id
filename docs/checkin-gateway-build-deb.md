@@ -109,6 +109,8 @@ journalctl -u checkin-gateway -n 30 --no-pager
 
 Log tốt: `[catalog]`, `[heartbeat] ok`, `[bootstrap] ok`, `[zk] live listen ON` (khi máy chấm TCP :4370 thông).
 
+Trên Device Monitor (ops logs tiếng Việt): `terminal_matched` / `connect_ok` khi catalog trùng IP:port local và ZK kết nối được; `connect_fail` nếu LAN tới máy chấm lỗi.
+
 ## OTA (cập nhật từ xa)
 
 Sau khi có `.deb` / `.tar.gz` (gzip) + SHA-256 trên HTTPS:
