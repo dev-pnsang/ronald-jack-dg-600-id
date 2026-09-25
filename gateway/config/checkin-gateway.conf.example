@@ -14,7 +14,7 @@ base_url=https://your-host.example.com/api/v1
 data_dir=/var/lib/checkin-gateway
 
 agent_name=checkin-gateway
-agent_version=1.2.7
+agent_version=1.2.8
 
 # ATTLOG: gateway syncs twice daily at local 00:00 and 12:00 only,
 # filtering punches from attendance_devices.usage_started_on; skips if fingerprint unchanged.

@@ -2,7 +2,7 @@
 # Build a .deb that installs checkin-gateway + checkin-ota (separate units) + ctl.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${CHECKIN_GATEWAY_VERSION:-1.2.7}"
+VERSION="${CHECKIN_GATEWAY_VERSION:-1.2.8}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo arm64)"
 NAME="checkin-gateway"
 PKG="${NAME}_${VERSION}_${ARCH}"

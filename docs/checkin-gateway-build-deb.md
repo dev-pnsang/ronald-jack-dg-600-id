@@ -1,7 +1,7 @@
 # Build & cài `.deb` Checkin Gateway
 
 > Cập nhật: 2026-09-25  
-> Package hiện tại: **checkin-gateway 1.2.7** (arm64)  
+> Package hiện tại: **checkin-gateway 1.2.8** (arm64)  
 > Gồm 2 process độc lập: `checkin-gateway` + `checkin-ota`
 
 ## Kiến trúc CPU (bắt buộc)
@@ -29,15 +29,15 @@ sudo apt-get install -y build-essential cmake pkg-config \
   libcurl4-openssl-dev libssl-dev libsqlite3-dev nlohmann-json3-dev
 ```
 
-## Build `.deb` 1.2.7
+## Build `.deb` 1.2.8
 
 Từ thư mục `gateway/` trong repo:
 
 ```bash
 cd /path/to/ronald-jack-dg-600-id/gateway
 
-# Version mặc định trong scripts/build-deb.sh là 1.2.7; có thể override:
-export CHECKIN_GATEWAY_VERSION=1.2.7
+# Version mặc định trong scripts/build-deb.sh là 1.2.8; có thể override:
+export CHECKIN_GATEWAY_VERSION=1.2.8
 
 ./scripts/build-deb.sh
 ```
@@ -45,7 +45,7 @@ export CHECKIN_GATEWAY_VERSION=1.2.7
 Kết quả:
 
 ```text
-dist/checkin-gateway_1.2.7_arm64.deb
+dist/checkin-gateway_1.2.8_arm64.deb
 ```
 
 Gói cài:
@@ -61,7 +61,7 @@ Gói cài:
 
 ```bash
 # Copy file sang máy đích rồi:
-sudo dpkg -i ./checkin-gateway_1.2.7_arm64.deb
+sudo dpkg -i ./checkin-gateway_1.2.8_arm64.deb
 # nếu thiếu shared libs:
 sudo apt-get -y -f install
 ```
@@ -80,12 +80,12 @@ sudo checkin-gatewayctl status
 
 Kỳ vọng: `enrolled=true`, cả `checkin-gateway` và `checkin-ota` đều `active` / `enabled`.
 
-Từ **1.2.7**, enroll (chạy root) tự `chown` `state.db` sang user `checkin-gateway` — tránh lỗi `store: unable to open database file`.
+Từ **1.2.8**, enroll (chạy root) tự `chown` `state.db` sang user `checkin-gateway` — tránh lỗi `store: unable to open database file`.
 
 ### Nâng cấp (máy đã enroll)
 
 ```bash
-sudo dpkg -i ./checkin-gateway_1.2.7_arm64.deb
+sudo dpkg -i ./checkin-gateway_1.2.8_arm64.deb
 # conf + state.db được giữ; postinst restart gateway (OTA unit độc lập)
 sudo checkin-gatewayctl status
 ```
@@ -122,6 +122,8 @@ sudo /usr/bin/checkin-ota --once --config /etc/checkin-gateway/checkin-gateway.c
 ```
 
 Agent nhận diện format bằng magic bytes (`.tar.gz` hoặc `.deb`). Khi cài chỉ restart **checkin-gateway**, không kill process OTA.
+
+**Conffile khi OTA `.deb`:** agent chạy `dpkg --force-confdef --force-confold` + `DEBIAN_FRONTEND=noninteractive` → **không hỏi** Y/N; **giữ** `/etc/checkin-gateway/checkin-gateway.conf` đang dùng (không ghi đè `base_url` / `device_ip`). Không chọn `Y` kiểu tay khi chạy `--once` trên terminal với bản OTA cũ hơn fix này.
 
 ## Xem thêm
 

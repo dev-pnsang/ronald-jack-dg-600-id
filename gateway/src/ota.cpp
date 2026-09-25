@@ -145,8 +145,12 @@ bool RestartGatewayOnly(std::string& err) {
 }
 
 bool InstallDeb(const std::string& deb_path, std::string& err) {
-  std::string cmd = "DEBIAN_FRONTEND=noninteractive dpkg -i " + ShellQuote(deb_path) +
-                    " || DEBIAN_FRONTEND=noninteractive apt-get -y -f install";
+  // Unattended OTA: never prompt on TTY. Keep local conf (base_url, device_ip, …).
+  std::string cmd =
+      "DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold -i " +
+      ShellQuote(deb_path) +
+      " || DEBIAN_FRONTEND=noninteractive apt-get -y "
+      "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -f install";
   if (std::system(cmd.c_str()) != 0) {
     err = "dpkg install failed";
     return false;
