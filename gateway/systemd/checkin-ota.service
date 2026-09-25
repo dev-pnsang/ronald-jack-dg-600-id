@@ -1,15 +1,21 @@
 [Unit]
 Description=CommaDesk Checkin OTA agent
-After=network-online.target checkin-gateway.service
+Documentation=file:///usr/share/doc/checkin-gateway/README.md
+After=network-online.target
 Wants=network-online.target
+# Do NOT BindsTo/PartOf checkin-gateway — OTA must survive a bad gateway upgrade
+# so the device can still pull a fixed package.
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/ronald-jack-dg-600-id/gateway
-ExecStart=/usr/local/bin/checkin-ota --config /root/ronald-jack-dg-600-id/gateway/config/checkin-gateway.conf
+ExecStart=/usr/bin/checkin-ota --config /etc/checkin-gateway/checkin-gateway.conf
 Restart=on-failure
 RestartSec=30
+# Exit 2 = not enrolled yet — do not thrash restart
+RestartPreventExitStatus=2
+KillMode=mixed
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

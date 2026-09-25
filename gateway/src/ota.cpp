@@ -1,5 +1,4 @@
 #include "ota.hpp"
-#include <algorithm>
 
 #include <atomic>
 #include <chrono>
@@ -7,7 +6,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
@@ -19,6 +20,12 @@ namespace cg {
 namespace {
 
 std::atomic<bool> g_ota_running{true};
+
+// Production layout — never touch checkin-ota while installing gateway.
+constexpr const char* kGatewayBin = "/usr/bin/checkin-gateway";
+constexpr const char* kOtaBin = "/usr/bin/checkin-ota";
+constexpr const char* kGatewayService = "checkin-gateway";
+constexpr const char* kOtaService = "checkin-ota";
 
 std::string ShellQuote(const std::string& s) {
   std::string out = "'";
@@ -77,24 +84,92 @@ bool DownloadUrl(const std::string& url, const std::string& dest, int timeout_se
   return true;
 }
 
-bool CurrentOtaSlot(std::string& slot) {
+std::vector<std::pair<int, int>> ParseHHMMList(const std::string& csv) {
+  std::vector<std::pair<int, int>> out;
+  std::stringstream ss(csv);
+  std::string part;
+  while (std::getline(ss, part, ',')) {
+    int h = -1, m = -1;
+    if (std::sscanf(part.c_str(), "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      out.emplace_back(h, m);
+    }
+  }
+  if (out.empty()) {
+    out.emplace_back(3, 30);
+    out.emplace_back(15, 30);
+  }
+  return out;
+}
+
+bool CurrentOtaSlot(const std::vector<std::pair<int, int>>& slots, std::string& slot) {
   std::time_t now = std::time(nullptr);
   std::tm local{};
   localtime_r(&now, &local);
-  if (local.tm_hour == 3 && local.tm_min >= 30 && local.tm_min <= 31) {
-    slot = "03:30";
-    return true;
-  }
-  if (local.tm_hour == 15 && local.tm_min >= 30 && local.tm_min <= 31) {
-    slot = "15:30";
-    return true;
+  for (const auto& hm : slots) {
+    if (local.tm_hour == hm.first && local.tm_min >= hm.second && local.tm_min <= hm.second + 1) {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%02d:%02d", hm.first, hm.second);
+      slot = buf;
+      return true;
+    }
   }
   slot.clear();
   return false;
 }
 
-bool InstallArtifact(const std::string& archive, const std::string& install_path,
-                     const std::string& service_name, std::string& err) {
+enum class ArtifactFormat { GzipTar, Deb, Unknown };
+
+ArtifactFormat DetectArtifactFormat(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return ArtifactFormat::Unknown;
+  unsigned char mag[8] = {};
+  in.read(reinterpret_cast<char*>(mag), 8);
+  const auto n = in.gcount();
+  if (n >= 2 && mag[0] == 0x1f && mag[1] == 0x8b) return ArtifactFormat::GzipTar;
+  if (n >= 8 && mag[0] == '!' && mag[1] == '<' && mag[2] == 'a' && mag[3] == 'r' &&
+      mag[4] == 'c' && mag[5] == 'h' && mag[6] == '>' && mag[7] == '\n') {
+    return ArtifactFormat::Deb;
+  }
+  return ArtifactFormat::Unknown;
+}
+
+bool RestartGatewayOnly(std::string& err) {
+  // Never restart checkin-ota from inside an OTA install cycle.
+  std::string cmd = std::string("systemctl restart ") + kGatewayService +
+                    " || systemctl start " + kGatewayService;
+  if (std::system(cmd.c_str()) != 0) {
+    err = "service_start_failed";
+    return false;
+  }
+  return true;
+}
+
+bool InstallDeb(const std::string& deb_path, std::string& err) {
+  std::string cmd = "DEBIAN_FRONTEND=noninteractive dpkg -i " + ShellQuote(deb_path) +
+                    " || DEBIAN_FRONTEND=noninteractive apt-get -y -f install";
+  if (std::system(cmd.c_str()) != 0) {
+    err = "dpkg install failed";
+    return false;
+  }
+  // Package postinst may enable units; ensure gateway is up without killing OTA.
+  return RestartGatewayOnly(err);
+}
+
+bool AtomicInstallBinary(const std::string& src, const std::string& dest, std::string& err) {
+  std::string tmp = std::string(dest) + ".new";
+  if (std::system(("install -m 0755 " + ShellQuote(src) + " " + ShellQuote(tmp)).c_str()) != 0) {
+    err = "install binary failed: " + dest;
+    return false;
+  }
+  if (std::rename(tmp.c_str(), dest.c_str()) != 0) {
+    err = "atomic replace failed: " + dest;
+    return false;
+  }
+  return true;
+}
+
+bool InstallTarGz(const std::string& archive, std::string& err, bool* ota_updated) {
+  if (ota_updated) *ota_updated = false;
   std::string work = "/var/tmp/checkin-ota/extract";
   std::system(("rm -rf " + work + " && mkdir -p " + work).c_str());
   std::string untar = "tar -xzf " + ShellQuote(archive) + " -C " + ShellQuote(work);
@@ -106,7 +181,7 @@ bool InstallArtifact(const std::string& archive, const std::string& install_path
   struct stat st {};
   if (::stat(install_sh.c_str(), &st) == 0) {
     std::string cmd = "chmod +x " + ShellQuote(install_sh) + " && " + ShellQuote(install_sh) + " " +
-                      ShellQuote(install_path) + " " + ShellQuote(service_name);
+                      ShellQuote(kGatewayBin) + " " + ShellQuote(kGatewayService);
     if (std::system(cmd.c_str()) != 0) {
       err = "install.sh failed";
       return false;
@@ -118,25 +193,63 @@ bool InstallArtifact(const std::string& archive, const std::string& install_path
     err = "artifact missing checkin-gateway binary";
     return false;
   }
-  std::system(("systemctl stop " + service_name + " || true").c_str());
-  std::string tmp = install_path + ".new";
-  if (std::system(("install -m 0755 " + ShellQuote(bin) + " " + ShellQuote(tmp)).c_str()) != 0) {
-    err = "install binary failed";
-    return false;
+  std::system((std::string("systemctl stop ") + kGatewayService + " || true").c_str());
+  if (!AtomicInstallBinary(bin, kGatewayBin, err)) return false;
+
+  std::string ota_src = work + "/checkin-ota";
+  if (::stat(ota_src.c_str(), &st) == 0) {
+    // Replace OTA binary under our feet (inode stays until we exit); restart after report.
+    if (!AtomicInstallBinary(ota_src, kOtaBin, err)) return false;
+    if (ota_updated) *ota_updated = true;
   }
-  if (std::rename(tmp.c_str(), install_path.c_str()) != 0) {
-    err = "atomic replace failed";
-    return false;
+
+  return RestartGatewayOnly(err);
+}
+
+bool InstallArtifact(const std::string& archive, std::string& err, bool* ota_updated) {
+  const ArtifactFormat fmt = DetectArtifactFormat(archive);
+  if (fmt == ArtifactFormat::GzipTar) {
+    std::fprintf(stderr, "[ota] artifact format=tar.gz path=%s\n", kGatewayBin);
+    return InstallTarGz(archive, err, ota_updated);
   }
-  if (std::system(("systemctl start " + service_name).c_str()) != 0) {
-    err = "service_start_failed";
-    return false;
+  if (fmt == ArtifactFormat::Deb) {
+    std::fprintf(stderr, "[ota] artifact format=deb\n");
+    return InstallDeb(archive, err);
   }
-  return true;
+  err =
+      "unsupported artifact (need .tar.gz or .deb; got raw binary/html/other — check download URL)";
+  return false;
+}
+
+void ApplyBootstrapOtaTimes(Config& cfg, Store& store, HttpClient& http, Credential& cred) {
+  (void)cfg;
+  std::string err;
+  auto r = SignedRequest(cfg, http, cred, "GET", "/device-identity/bootstrap", "");
+  if (!r.ok) {
+    std::fprintf(stderr, "[ota] bootstrap fail: %s\n", r.error.c_str());
+    return;
+  }
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    auto d = j.at("data");
+    if (d.contains("ota_check_times") && d["ota_check_times"].is_array()) {
+      std::string csv;
+      for (const auto& t : d["ota_check_times"]) {
+        if (!t.is_string()) continue;
+        if (!csv.empty()) csv += ",";
+        csv += t.get<std::string>();
+      }
+      if (!csv.empty()) {
+        store.SetMeta("ota_check_times", csv, err);
+        std::fprintf(stderr, "[ota] bootstrap ota_check_times=%s\n", csv.c_str());
+      }
+    }
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "[ota] bootstrap parse: %s\n", ex.what());
+  }
 }
 
 bool RunOneCycle(Config& cfg, Store& store, HttpClient& http, Credential& cred) {
-  (void)store;
   std::string err;
   OtaCheckInfo info;
   if (!OtaCheck(cfg, http, cred, info, err)) {
@@ -156,7 +269,7 @@ bool RunOneCycle(Config& cfg, Store& store, HttpClient& http, Credential& cred) 
 
   std::string dir = "/var/tmp/checkin-ota";
   EnsureDir(dir, err);
-  std::string archive = dir + "/package.tar.gz";
+  std::string archive = dir + "/package.bin";
   if (!DownloadUrl(info.download_url, archive, cfg.http_timeout_sec, err)) {
     std::string e2;
     OtaReport(cfg, http, cred, info.job_id, "failed", 0, "download_timeout", err, "", e2);
@@ -175,7 +288,8 @@ bool RunOneCycle(Config& cfg, Store& store, HttpClient& http, Credential& cred) 
   }
 
   std::string ierr;
-  if (!InstallArtifact(archive, "/usr/local/bin/checkin-gateway", "checkin-gateway", ierr)) {
+  bool ota_updated = false;
+  if (!InstallArtifact(archive, ierr, &ota_updated)) {
     std::string e2;
     const char* code = (ierr == "service_start_failed") ? "service_start_failed" : "install_error";
     OtaReport(cfg, http, cred, info.job_id, "failed", 0, code, ierr, "", e2);
@@ -186,7 +300,14 @@ bool RunOneCycle(Config& cfg, Store& store, HttpClient& http, Credential& cred) 
     std::fprintf(stderr, "[ota] report success fail: %s\n", err.c_str());
     return false;
   }
-  std::fprintf(stderr, "[ota] success installed_version=%s\n", info.package_version.c_str());
+  std::fprintf(stderr, "[ota] success installed_version=%s gateway=%s\n",
+               info.package_version.c_str(), kGatewayBin);
+
+  if (ota_updated) {
+    // Restart ourselves AFTER success report so a bad self-update still reported.
+    std::fprintf(stderr, "[ota] scheduling restart of %s (new binary installed)\n", kOtaService);
+    std::system(("systemctl restart " + std::string(kOtaService) + " || true").c_str());
+  }
   return true;
 }
 
@@ -254,15 +375,31 @@ int RunOtaService(Config cfg, bool once) {
   }
   HttpClient http(cfg.http_timeout_sec);
 
+  ApplyBootstrapOtaTimes(cfg, store, http, cred);
+
   if (once) {
     return RunOneCycle(cfg, store, http, cred) ? 0 : 1;
   }
 
   std::string last_slot;
   store.GetMeta("ota_last_sync_slot", last_slot, err);
+  std::string times_csv = "03:30,15:30";
+  store.GetMeta("ota_check_times", times_csv, err);
+  if (times_csv.empty()) times_csv = "03:30,15:30";
+  auto slots = ParseHHMMList(times_csv);
+
+  int64_t last_bootstrap = 0;
   while (g_ota_running) {
+    int64_t now = UnixNow();
+    if (now - last_bootstrap >= 3600) {
+      ApplyBootstrapOtaTimes(cfg, store, http, cred);
+      store.GetMeta("ota_check_times", times_csv, err);
+      if (times_csv.empty()) times_csv = "03:30,15:30";
+      slots = ParseHHMMList(times_csv);
+      last_bootstrap = now;
+    }
     std::string slot;
-    if (CurrentOtaSlot(slot) && slot != last_slot) {
+    if (CurrentOtaSlot(slots, slot) && slot != last_slot) {
       std::fprintf(stderr, "[ota] scheduled slot=%s\n", slot.c_str());
       RunOneCycle(cfg, store, http, cred);
       last_slot = slot;

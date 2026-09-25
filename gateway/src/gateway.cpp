@@ -5,6 +5,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <sstream>
 #include <ctime>
 #include <fstream>
 #include <thread>
@@ -178,18 +179,68 @@ bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, 
 }
 
 
-// Fire only in the first 90 seconds of local 00:00 and 12:00 (once per slot key).
-std::string CurrentAttlogSyncSlot() {
+// Fire in the first ~90s of each configured HH:MM slot (once per slot key).
+std::string CurrentAttlogSyncSlot(const std::string& times_csv) {
   std::time_t now = std::time(nullptr);
   std::tm tmb{};
   localtime_r(&now, &tmb);
-  if (tmb.tm_hour != 0 && tmb.tm_hour != 12) return "";
-  if (tmb.tm_min != 0) return "";
-  if (tmb.tm_sec > 90) return "";
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d-%02d", tmb.tm_year + 1900, tmb.tm_mon + 1,
-                tmb.tm_mday, tmb.tm_hour);
-  return buf;
+  std::string csv = times_csv.empty() ? "00:00,12:00" : times_csv;
+  std::stringstream ss(csv);
+  std::string part;
+  while (std::getline(ss, part, ',')) {
+    int h = -1, m = -1;
+    if (std::sscanf(part.c_str(), "%d:%d", &h, &m) != 2) continue;
+    if (h < 0 || h > 23 || m < 0 || m > 59) continue;
+    if (tmb.tm_hour != h) continue;
+    int mins = tmb.tm_min * 60 + tmb.tm_sec;
+    int target = m * 60;
+    if (mins < target || mins > target + 90) continue;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d-%02d%02d", tmb.tm_year + 1900, tmb.tm_mon + 1,
+                  tmb.tm_mday, h, m);
+    return buf;
+  }
+  return "";
+}
+
+void ApplyDeviceBootstrap(Config& cfg, Store& store, HttpClient& http, Credential& cred) {
+  auto r = SignedRequest(cfg, http, cred, "GET", "/device-identity/bootstrap", "");
+  if (!r.ok) {
+    std::fprintf(stderr, "[bootstrap] fail: %s %s\n", r.error.c_str(),
+                 r.body.substr(0, 160).c_str());
+    return;
+  }
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    auto d = j.at("data");
+    if (d.contains("discover_terminals")) {
+      cfg.discover_terminals = d.value("discover_terminals", cfg.discover_terminals);
+    }
+    if (d.contains("catalog_refresh_sec")) {
+      int v = d.value("catalog_refresh_sec", cfg.catalog_refresh_sec);
+      if (v >= 60) cfg.catalog_refresh_sec = v;
+    }
+    if (d.contains("attlog_sync_times") && d["attlog_sync_times"].is_array()) {
+      std::string csv;
+      for (const auto& t : d["attlog_sync_times"]) {
+        if (!t.is_string()) continue;
+        if (!csv.empty()) csv += ",";
+        csv += t.get<std::string>();
+      }
+      if (!csv.empty()) cfg.attlog_sync_times = csv;
+    }
+    std::string e2;
+    store.SetMeta("bootstrap_channel_mode",
+                  d.value("checkin_channel_mode", std::string("both")), e2);
+    store.SetMeta("attlog_sync_times", cfg.attlog_sync_times, e2);
+    std::fprintf(stderr,
+                 "[bootstrap] ok discover=%d catalog_sec=%d attlog=%s channel=%s\n",
+                 cfg.discover_terminals ? 1 : 0, cfg.catalog_refresh_sec,
+                 cfg.attlog_sync_times.c_str(),
+                 d.value("checkin_channel_mode", std::string("both")).c_str());
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "[bootstrap] parse: %s\n", ex.what());
+  }
 }
 
 bool PunchOnOrAfter(const AttendanceEvent& ev, const std::string& ymd) {
@@ -632,12 +683,14 @@ int RunGateway(const Config& cfg_in) {
     }
   }
 
+  ApplyDeviceBootstrap(cfg, store, http, cred);
+
   std::fprintf(stderr,
                "[gateway] start agent=%s version=%s base_url=%s discover=%d terminals=%zu "
-               "attlog_sync=00:00+12:00 live_listen=%d ingest_minimal=%d\n",
+               "attlog_sync=%s live_listen=%d ingest_minimal=%d\n",
                cfg.agent_name.c_str(), cfg.agent_version.c_str(), cfg.base_url.c_str(),
-               cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.live_listen ? 1 : 0,
-               cfg.ingest_minimal ? 1 : 0);
+               cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.attlog_sync_times.c_str(),
+               cfg.live_listen ? 1 : 0, cfg.ingest_minimal ? 1 : 0);
 
   // Sync device wall-clock from gateway local time on every service start (DG-600 often
   // boots at 2000-01-01 after power loss).
@@ -685,6 +738,7 @@ int RunGateway(const Config& cfg_in) {
   int64_t last_catalog = UnixNow();
   int64_t last_prune = 0;
   int64_t last_heartbeat = UnixNow();
+  int64_t last_bootstrap = UnixNow();
   std::string last_sync_slot;
   {
     std::string meta_err;
@@ -869,6 +923,10 @@ int RunGateway(const Config& cfg_in) {
 
   while (g_running) {
     int64_t now = UnixNow();
+    if (now - last_bootstrap >= std::max(60, cfg.bootstrap_refresh_sec)) {
+      last_bootstrap = now;
+      ApplyDeviceBootstrap(cfg, store, http, cred);
+    }
     if (cfg.discover_terminals &&
         (now - last_catalog >= std::max(60, cfg.catalog_refresh_sec))) {
       last_catalog = now;
@@ -893,7 +951,7 @@ int RunGateway(const Config& cfg_in) {
       }
     }
 
-    std::string slot = CurrentAttlogSyncSlot();
+    std::string slot = CurrentAttlogSyncSlot(cfg.attlog_sync_times);
     if (!slot.empty() && slot != last_sync_slot && !terminals.empty()) {
       // Drop live session before bulk ATTLOG — RegEvent breaks after USERTEMP/ATTLOG on DG-600.
       live_device.Disconnect();

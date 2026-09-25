@@ -15,8 +15,8 @@ Usage: checkin-gatewayctl <command> [args]
   set-device <ip> [port]  Set ZK terminal IP/port (default port 4370)
   enroll <pairing>     Enroll Device Identity once
   status               Show config + enrolled state
-  restart              systemctl restart checkin-gateway
-  enable               systemctl enable --now checkin-gateway
+  restart              systemctl restart checkin-gateway (OTA untouched)
+  enable               systemctl enable --now checkin-gateway + checkin-ota
 
 Env: CHECKIN_GATEWAY_CONF, CHECKIN_GATEWAY_BIN
 EOF
@@ -40,14 +40,15 @@ case "$cmd" in
     ;;
   status)
     "$BIN" --config "$CONF" --status
-    systemctl is-active checkin-gateway 2>/dev/null || true
-    systemctl is-enabled checkin-gateway 2>/dev/null || true
+    echo "gateway: $(systemctl is-active checkin-gateway 2>/dev/null || true) / $(systemctl is-enabled checkin-gateway 2>/dev/null || true)"
+    echo "ota:     $(systemctl is-active checkin-ota 2>/dev/null || true) / $(systemctl is-enabled checkin-ota 2>/dev/null || true)"
     ;;
   restart)
     systemctl restart checkin-gateway
     ;;
   enable)
-    systemctl enable --now checkin-gateway
+    systemctl enable --now checkin-gateway.service
+    systemctl enable --now checkin-ota.service
     ;;
   -h|--help|"")
     usage
