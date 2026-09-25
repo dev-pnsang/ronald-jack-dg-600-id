@@ -29,7 +29,7 @@ void Usage(const char* argv0) {
                "  %s --config <path> device set --host <ip> [--port <port>]\n"
                "\n"
                "Local ZK tools:\n"
-               "  %s --config <path> --discover|--sync-time|--listen [--result-dir <dir>]\n"
+               "  %s --config <path> --discover|--sync-time|--sync-users|--listen [--result-dir <dir>]\n"
                "\n"
                "Options: --log-level debug|info|warning|error\n",
                argv0, argv0, argv0, argv0, argv0, argv0, argv0);
@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
   bool ack_rotate = false;
   bool discover = false;
   bool sync_time = false;
+  bool sync_users = false;
   bool listen = false;
   bool device_set = false;
   bool server_set = false;
@@ -75,6 +76,8 @@ int main(int argc, char** argv) {
       discover = true;
     } else if (std::strcmp(argv[i], "--sync-time") == 0) {
       sync_time = true;
+    } else if (std::strcmp(argv[i], "--sync-users") == 0) {
+      sync_users = true;
     } else if (std::strcmp(argv[i], "--listen") == 0) {
       listen = true;
     } else if (std::strcmp(argv[i], "--result-dir") == 0 && i + 1 < argc) {
@@ -133,8 +136,9 @@ int main(int argc, char** argv) {
 
   int mode_count = static_cast<int>(enroll) + static_cast<int>(ack_rotate) +
                    static_cast<int>(discover) + static_cast<int>(sync_time) +
-                   static_cast<int>(listen) + static_cast<int>(device_set) +
-                   static_cast<int>(server_set) + static_cast<int>(status);
+                   static_cast<int>(sync_users) + static_cast<int>(listen) +
+                   static_cast<int>(device_set) + static_cast<int>(server_set) +
+                   static_cast<int>(status);
   if (mode_count > 1) {
     std::fprintf(stderr, "Use only one mode at a time\n");
     return 1;
@@ -223,6 +227,9 @@ int main(int argc, char** argv) {
   }
   if (sync_time) {
     return cg::RunSyncTime(cfg, result_dir);
+  }
+  if (sync_users) {
+    return cg::RunSyncUsers(cfg);
   }
   if (listen) {
     return cg::RunListen(cfg, result_dir);

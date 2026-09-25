@@ -33,4 +33,4 @@ reconnect_delay_sec=5
 outbox_retry_sec=15
 outbox_max_attempts=50
 outbox_retention_days=14
-http_timeout_sec=30
+http_timeout_sec=90

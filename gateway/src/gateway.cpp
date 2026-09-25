@@ -132,21 +132,21 @@ std::string SanitizeUtf8Users(const std::string& s) {
   return out;
 }
 
-void SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
+bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
                              const std::string& terminal_id, const std::string& terminal_ip,
-                             const std::vector<UserRecord>& users) {
+                             const std::vector<UserRecord>& users, bool force = false) {
   if (users.empty()) {
     std::fprintf(stderr, "[users] %s empty catalog (skip)\n", terminal_ip.c_str());
-    return;
+    return false;
   }
   std::string fp = FingerprintUsers(users);
   std::string fp_key = "users_fp:" + (terminal_id.empty() ? terminal_ip : terminal_id);
   std::string prev_fp;
   std::string meta_err;
   store.GetMeta(fp_key, prev_fp, meta_err);
-  if (!prev_fp.empty() && prev_fp == fp) {
+  if (!force && !prev_fp.empty() && prev_fp == fp) {
     std::fprintf(stderr, "[users] %s unchanged fp=%s (skip PUT)\n", terminal_ip.c_str(), fp.c_str());
-    return;
+    return true;
   }
   nlohmann::json body;
   body["terminal_ip"] = terminal_ip;
@@ -161,15 +161,20 @@ void SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, 
     arr.push_back(std::move(row));
   }
   body["users"] = std::move(arr);
-  auto r = SignedRequest(cfg, http, cred, "PUT", "/checkin/machine-users", body.dump());
+  const size_t user_n = body["users"].size();
+  std::string raw = body.dump();
+  std::fprintf(stderr, "[users] PUT /checkin/machine-users terminal_ip=%s count=%zu bytes=%zu%s\n",
+               terminal_ip.c_str(), user_n, raw.size(), force ? " (force)" : "");
+  auto r = SignedRequest(cfg, http, cred, "PUT", "/checkin/machine-users", raw);
   if (!r.ok) {
     std::fprintf(stderr, "[users] PUT fail %s: %s %s\n", terminal_ip.c_str(), r.error.c_str(),
-                 r.body.substr(0, 200).c_str());
-    return;
+                 r.body.substr(0, 400).c_str());
+    return false;
   }
   store.SetMeta(fp_key, fp, meta_err);
-  std::fprintf(stderr, "[users] synced %zu from %s fp=%s\n", users.size(), terminal_ip.c_str(),
-               fp.c_str());
+  std::fprintf(stderr, "[users] synced %zu from %s fp=%s status=%ld body=%s\n", user_n,
+               terminal_ip.c_str(), fp.c_str(), r.status, r.body.substr(0, 200).c_str());
+  return true;
 }
 
 
@@ -394,6 +399,87 @@ int RunAckRotate(const Config& cfg, const std::string& secrets_json_path) {
   }
   HardenDataDir(cfg);
   std::fprintf(stdout, "Rotate ACK OK. New secrets stored. Old credential revoked server-side.\n");
+  return 0;
+}
+
+int RunSyncUsers(const Config& cfg_in) {
+  Config cfg = cfg_in;
+  std::string err;
+  if (!EnsureDir(cfg.data_dir, err)) {
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return 1;
+  }
+  Store store;
+  if (!store.Open(cfg.data_dir + "/state.db", err)) {
+    std::fprintf(stderr, "store: %s\n", err.c_str());
+    return 1;
+  }
+  Credential cred;
+  if (!store.LoadCredential(cred, err)) {
+    std::fprintf(stderr, "Not enrolled: %s\n", err.c_str());
+    return 2;
+  }
+
+  HttpClient http(cfg.http_timeout_sec);
+  std::string tip = cfg.device_ip;
+  int tport = cfg.device_port;
+  std::string tid;
+  std::string tname = "config";
+
+  if (cfg.discover_terminals) {
+    auto r = SignedRequest(cfg, http, cred, "GET", "/checkin/terminals", "");
+    if (r.ok) {
+      try {
+        auto j = nlohmann::json::parse(r.body);
+        auto data = j.contains("data") ? j["data"] : j;
+        if (data.is_array() && !data.empty()) {
+          const auto& row = data[0];
+          tip = row.value("ip_address", tip);
+          tport = row.value("port", tport);
+          tid = row.value("id", "");
+          tname = row.value("name", tname);
+          if (tport <= 0) tport = 4370;
+        }
+      } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[users] catalog parse: %s — using config device_ip\n", ex.what());
+      }
+    } else {
+      std::fprintf(stderr, "[users] catalog fail: %s — using config device_ip\n", r.error.c_str());
+    }
+  }
+
+  if (tip.empty()) {
+    std::fprintf(stderr, "[users] no terminal IP configured\n");
+    return 1;
+  }
+
+  std::fprintf(stderr, "[users] reading from %s (%s) %s:%d ...\n", tname.c_str(), tid.c_str(),
+               tip.c_str(), tport);
+  ZkDevice device;
+  device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+  if (!device.Connect(tip, tport, cfg.device_password, cfg.device_timeout_sec, err)) {
+    std::fprintf(stderr, "[users] connect fail: %s\n", err.c_str());
+    return 3;
+  }
+  std::vector<UserRecord> users;
+  if (!device.ReadUsers(users, err)) {
+    std::fprintf(stderr, "[users] ReadUsers fail: %s\n", err.c_str());
+    device.Disconnect();
+    return 4;
+  }
+  device.Disconnect();
+
+  std::fprintf(stderr, "[users] device returned %zu user(s):\n", users.size());
+  for (const auto& u : users) {
+    std::fprintf(stderr, "  id=%s name=%s priv=%d enabled=%d\n", u.user_id.c_str(), u.name.c_str(),
+                 u.privilege, u.enabled ? 1 : 0);
+  }
+
+  if (!SyncMachineUsersCatalog(cfg, store, http, cred, tid, tip, users, /*force=*/true)) {
+    return 5;
+  }
+  std::fprintf(stdout, "OK synced %zu users from %s to %s/checkin/machine-users\n", users.size(),
+               tip.c_str(), cfg.base_url.c_str());
   return 0;
 }
 

@@ -43,7 +43,7 @@ struct Config {
   int outbox_retry_sec = 15;
   int outbox_max_attempts = 50;
   int outbox_retention_days = 14;  // prune seen + dead outbox older than this
-  int http_timeout_sec = 30;
+  int http_timeout_sec = 90;
 };
 
 // Load key=value config file. Missing keys keep defaults.
