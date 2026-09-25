@@ -1,0 +1,15 @@
+[Unit]
+Description=CommaDesk Checkin OTA agent
+After=network-online.target checkin-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ronald-jack-dg-600-id/gateway
+ExecStart=/usr/local/bin/checkin-ota --config /root/ronald-jack-dg-600-id/gateway/config/checkin-gateway.conf
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

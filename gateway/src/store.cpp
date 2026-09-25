@@ -1,3 +1,5 @@
+#include <ctime>
+#include <cstdio>
 #include "store.hpp"
 
 #include <sqlite3.h>
@@ -67,6 +69,22 @@ CREATE TABLE IF NOT EXISTS meta (
   }
   sqlite3_exec(static_cast<sqlite3*>(db_), "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
   sqlite3_exec(static_cast<sqlite3*>(db_), "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+
+  if (sqlite3_exec(db, R"SQL(
+CREATE TABLE IF NOT EXISTS ops_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_iso TEXT NOT NULL,
+  level TEXT NOT NULL,
+  component TEXT NOT NULL,
+  code TEXT,
+  message TEXT NOT NULL,
+  fields_json TEXT
+);
+)SQL", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    err = errmsg ? errmsg : "ops_outbox";
+    sqlite3_free(errmsg);
+    return false;
+  }
   return true;
 }
 
@@ -325,6 +343,85 @@ bool Store::GetMeta(const std::string& key, std::string& value, std::string& err
   }
   sqlite3_finalize(st);
   return ok;
+}
+
+
+bool Store::EnqueueOpsLog(const std::string& level, const std::string& component,
+                          const std::string& code, const std::string& message,
+                          const std::string& fields_json, std::string& err) {
+  sqlite3_stmt* st = nullptr;
+  const char* sql =
+      "INSERT INTO ops_outbox(ts_iso, level, component, code, message, fields_json) "
+      "VALUES(?,?,?,?,?,?)";
+  if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &st, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
+    return false;
+  }
+  // RFC3339-ish local via util UnixNow formatting is done by caller in ts; store wall now as ISO-ish
+  char buf[40];
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  localtime_r(&now, &tm);
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d%+03d:00",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+                7);  // +07 for VN deployments; server also accepts
+  sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, level.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, component.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 4, code.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 5, message.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 6, fields_json.c_str(), -1, SQLITE_TRANSIENT);
+  bool ok = sqlite3_step(st) == SQLITE_DONE;
+  if (!ok) err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
+  sqlite3_finalize(st);
+  return ok;
+}
+
+std::vector<OpsLogItem> Store::DueOpsLogs(int limit) {
+  std::vector<OpsLogItem> out;
+  sqlite3_stmt* st = nullptr;
+  const char* sql =
+      "SELECT id, ts_iso, level, component, code, message, fields_json FROM ops_outbox "
+      "ORDER BY id ASC LIMIT ?";
+  if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &st, nullptr) != SQLITE_OK) return out;
+  sqlite3_bind_int(st, 1, limit > 0 ? limit : 50);
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    OpsLogItem it;
+    it.id = sqlite3_column_int64(st, 0);
+    auto col = [&](int i) {
+      const unsigned char* p = sqlite3_column_text(st, i);
+      return p ? reinterpret_cast<const char*>(p) : "";
+    };
+    it.ts_iso = col(1);
+    it.level = col(2);
+    it.component = col(3);
+    it.code = col(4);
+    it.message = col(5);
+    it.fields_json = col(6);
+    out.push_back(it);
+  }
+  sqlite3_finalize(st);
+  return out;
+}
+
+bool Store::DeleteOpsLogs(const std::vector<int64_t>& ids, std::string& err) {
+  if (ids.empty()) return true;
+  for (int64_t id : ids) {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), "DELETE FROM ops_outbox WHERE id=?", -1, &st,
+                           nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
+      return false;
+    }
+    sqlite3_bind_int64(st, 1, id);
+    bool ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (!ok) {
+      err = "delete ops_outbox failed";
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace cg

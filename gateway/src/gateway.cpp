@@ -232,7 +232,12 @@ void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const
     std::fprintf(stderr, "[outbox] enqueue failed: %s\n", e2.c_str());
     return;
   }
-  std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
+  {
+  std::string oe;
+  store.EnqueueOpsLog("info", "gateway", "punch", "punch captured",
+    std::string("{\"user\":\"") + punch.user_id + "\"}", oe);
+}
+std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
                punch.timestamp_iso.c_str(), punch.verify_mode, punch.inout_mode,
                punch.from_live ? 1 : 0);
 }
@@ -272,6 +277,10 @@ void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Creden
 
     if (r.ok && r.status == 201) {
       store.MarkOutboxOk(item.id, err);
+      {
+        std::string oe;
+        store.EnqueueOpsLog("info", "ingest", "ingest_ok", "punch accepted", "{}", oe);
+      }
       std::fprintf(stderr, "[ingest] ok id=%lld status=%ld\n", static_cast<long long>(item.id),
                    r.status);
     } else {
@@ -298,6 +307,36 @@ void MaybePrune(Store& store, const Config& cfg) {
   int64_t cutoff = UnixNow() - static_cast<int64_t>(cfg.outbox_retention_days) * 24 * 3600;
   int n = store.Prune(cutoff, err);
   if (n > 0) std::fprintf(stderr, "[store] pruned %d old rows\n", n);
+}
+
+
+void FlushOpsLogs(Config& cfg, Store& store, HttpClient& http, Credential& cred) {
+  auto items = store.DueOpsLogs(50);
+  if (items.empty()) return;
+  nlohmann::json entries = nlohmann::json::array();
+  std::vector<int64_t> ids;
+  for (const auto& it : items) {
+    nlohmann::json e = {
+        {"ts", it.ts_iso},
+        {"level", it.level},
+        {"component", it.component},
+        {"message", it.message},
+    };
+    if (!it.code.empty()) e["code"] = it.code;
+    if (!it.fields_json.empty()) {
+      try { e["fields"] = nlohmann::json::parse(it.fields_json); } catch (...) {}
+    }
+    entries.push_back(e);
+    ids.push_back(it.id);
+  }
+  nlohmann::json body = {{"entries", entries}};
+  auto r = SignedRequest(cfg, http, cred, "POST", "/device-ops/logs", body.dump());
+  if (!r.ok) {
+    std::fprintf(stderr, "[ops] flush fail: %s %s\n", r.error.c_str(), r.body.substr(0, 160).c_str());
+    return;
+  }
+  std::string e2;
+  store.DeleteOpsLogs(ids, e2);
 }
 
 void HardenDataDir(const Config& cfg) {
@@ -871,6 +910,7 @@ int RunGateway(const Config& cfg_in) {
     }
 
     FlushOutbox(cfg, store, http, cred);
+    FlushOpsLogs(cfg, store, http, cred);
     now = UnixNow();
     if (now - last_prune > 3600) {
       last_prune = now;

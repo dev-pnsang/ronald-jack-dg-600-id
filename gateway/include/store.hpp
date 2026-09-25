@@ -18,6 +18,16 @@ struct OutboxItem {
   int64_t next_attempt_at = 0;
 };
 
+struct OpsLogItem {
+  int64_t id = 0;
+  std::string ts_iso;
+  std::string level;
+  std::string component;
+  std::string code;
+  std::string message;
+  std::string fields_json;
+};
+
 class Store {
  public:
   Store() = default;
@@ -44,6 +54,12 @@ class Store {
 
   bool SetMeta(const std::string& key, const std::string& value, std::string& err);
   bool GetMeta(const std::string& key, std::string& value, std::string& err);
+
+  bool EnqueueOpsLog(const std::string& level, const std::string& component,
+                     const std::string& code, const std::string& message,
+                     const std::string& fields_json, std::string& err);
+  std::vector<OpsLogItem> DueOpsLogs(int limit);
+  bool DeleteOpsLogs(const std::vector<int64_t>& ids, std::string& err);
 
  private:
   void* db_ = nullptr;  // sqlite3*
