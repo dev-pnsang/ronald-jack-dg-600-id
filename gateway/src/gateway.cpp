@@ -135,11 +135,22 @@ std::string SanitizeUtf8Users(const std::string& s) {
   return out;
 }
 
+// Ship short Vietnamese ops messages to CommaDesk Device Monitor (POST /device-ops/logs).
+// Keep codes stable (English snake_case); put human text in `message`.
+void OpsLog(Store& store, const char* level, const char* component, const char* code,
+            const std::string& message, const nlohmann::json& fields = nlohmann::json::object()) {
+  std::string oe;
+  store.EnqueueOpsLog(level, component, code, message, fields.dump(), oe);
+}
+
 bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
                              const std::string& terminal_id, const std::string& terminal_ip,
                              const std::vector<UserRecord>& users, bool force = false) {
   if (users.empty()) {
     std::fprintf(stderr, "[users] %s empty catalog (skip)\n", terminal_ip.c_str());
+    OpsLog(store, "warn", "users", "users_empty",
+           "Máy chấm công không có user id để đồng bộ",
+           {{"terminal_ip", terminal_ip}, {"terminal_id", terminal_id}});
     return false;
   }
   std::string fp = FingerprintUsers(users);
@@ -149,6 +160,10 @@ bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, 
   store.GetMeta(fp_key, prev_fp, meta_err);
   if (!force && !prev_fp.empty() && prev_fp == fp) {
     std::fprintf(stderr, "[users] %s unchanged fp=%s (skip PUT)\n", terminal_ip.c_str(), fp.c_str());
+    OpsLog(store, "info", "users", "users_unchanged",
+           "Danh sách user id không đổi — bỏ qua gửi lên server",
+           {{"terminal_ip", terminal_ip}, {"terminal_id", terminal_id}, {"fp", fp},
+            {"count", users.size()}});
     return true;
   }
   nlohmann::json body;
@@ -172,11 +187,24 @@ bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, 
   if (!r.ok) {
     std::fprintf(stderr, "[users] PUT fail %s: %s %s\n", terminal_ip.c_str(), r.error.c_str(),
                  r.body.substr(0, 400).c_str());
+    OpsLog(store, "error", "users", "users_put_fail",
+           "Gửi danh sách user id lên server thất bại",
+           {{"terminal_ip", terminal_ip},
+            {"terminal_id", terminal_id},
+            {"count", user_n},
+            {"detail", (r.error + " " + r.body.substr(0, 120)).substr(0, 160)}});
     return false;
   }
   store.SetMeta(fp_key, fp, meta_err);
   std::fprintf(stderr, "[users] synced %zu from %s fp=%s status=%ld body=%s\n", user_n,
                terminal_ip.c_str(), fp.c_str(), r.status, r.body.substr(0, 200).c_str());
+  OpsLog(store, "info", "users", "users_put_ok",
+         "Đã gửi danh sách user id lên server thành công",
+         {{"terminal_ip", terminal_ip},
+          {"terminal_id", terminal_id},
+          {"count", user_n},
+          {"force", force},
+          {"http_status", r.status}});
   return true;
 }
 
@@ -210,6 +238,9 @@ void ApplyDeviceBootstrap(Config& cfg, Store& store, HttpClient& http, Credentia
   if (!r.ok) {
     std::fprintf(stderr, "[bootstrap] fail: %s %s\n", r.error.c_str(),
                  r.body.substr(0, 160).c_str());
+    OpsLog(store, "warn", "bootstrap", "bootstrap_fail",
+           "Không lấy được cấu hình bootstrap từ server",
+           {{"detail", (r.error + " " + r.body.substr(0, 120)).substr(0, 160)}});
     return;
   }
   try {
@@ -231,17 +262,36 @@ void ApplyDeviceBootstrap(Config& cfg, Store& store, HttpClient& http, Credentia
       }
       if (!csv.empty()) cfg.attlog_sync_times = csv;
     }
+    if (d.contains("users_sync_times") && d["users_sync_times"].is_array()) {
+      std::string csv;
+      for (const auto& t : d["users_sync_times"]) {
+        if (!t.is_string()) continue;
+        if (!csv.empty()) csv += ",";
+        csv += t.get<std::string>();
+      }
+      if (!csv.empty()) cfg.users_sync_times = csv;
+    }
     std::string e2;
     store.SetMeta("bootstrap_channel_mode",
                   d.value("checkin_channel_mode", std::string("both")), e2);
     store.SetMeta("attlog_sync_times", cfg.attlog_sync_times, e2);
+    store.SetMeta("users_sync_times", cfg.users_sync_times, e2);
     std::fprintf(stderr,
-                 "[bootstrap] ok discover=%d catalog_sec=%d attlog=%s channel=%s\n",
+                 "[bootstrap] ok discover=%d catalog_sec=%d attlog=%s users=%s channel=%s\n",
                  cfg.discover_terminals ? 1 : 0, cfg.catalog_refresh_sec,
-                 cfg.attlog_sync_times.c_str(),
+                 cfg.attlog_sync_times.c_str(), cfg.users_sync_times.c_str(),
                  d.value("checkin_channel_mode", std::string("both")).c_str());
+    OpsLog(store, "info", "bootstrap", "bootstrap_ok",
+           "Đã nhận cấu hình bootstrap từ server",
+           {{"discover_terminals", cfg.discover_terminals},
+            {"catalog_refresh_sec", cfg.catalog_refresh_sec},
+            {"attlog_sync_times", cfg.attlog_sync_times},
+            {"users_sync_times", cfg.users_sync_times},
+            {"checkin_channel_mode", d.value("checkin_channel_mode", std::string("both"))}});
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "[bootstrap] parse: %s\n", ex.what());
+    OpsLog(store, "error", "bootstrap", "bootstrap_parse_fail",
+           "Phân tích cấu hình bootstrap thất bại", {{"detail", ex.what()}});
   }
 }
 
@@ -252,14 +302,6 @@ bool PunchOnOrAfter(const AttendanceEvent& ev, const std::string& ymd) {
   if (ev.year != y) return ev.year > y;
   if (ev.month != m) return ev.month > m;
   return ev.day >= d;
-}
-
-// Ship short Vietnamese ops messages to CommaDesk Device Monitor (POST /device-ops/logs).
-// Keep codes stable (English snake_case); put human text in `message`.
-void OpsLog(Store& store, const char* level, const char* component, const char* code,
-            const std::string& message, const nlohmann::json& fields = nlohmann::json::object()) {
-  std::string oe;
-  store.EnqueueOpsLog(level, component, code, message, fields.dump(), oe);
 }
 
 void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const AttendanceEvent& ev) {
@@ -279,22 +321,37 @@ void EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const
     std::fprintf(stderr,
                  "[punch] bad device clock (%s) — using gateway time %s user=%s\n",
                  ev.timestamp_iso.c_str(), punch.timestamp_iso.c_str(), punch.user_id.c_str());
+    OpsLog(store, "warn", "gateway", "punch_bad_clock",
+           "Đồng hồ máy chấm công sai — dùng giờ gateway cho bản ghi",
+           {{"user", punch.user_id},
+            {"device_ts", ev.timestamp_iso},
+            {"gateway_ts", punch.timestamp_iso}});
   }
   std::string body;
   try {
     body = BuildIngestBody(punch, info, cfg);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "[punch] skip bad body user=%s: %s\n", punch.user_id.c_str(), ex.what());
+    OpsLog(store, "error", "gateway", "punch_bad_body",
+           "Bỏ qua chấm công vì dữ liệu không hợp lệ",
+           {{"user", punch.user_id}, {"detail", ex.what()}});
     return;
   }
   auto key = DedupeKey(punch);
   std::string e2;
   if (!store.Enqueue(key, body, e2)) {
     std::fprintf(stderr, "[outbox] enqueue failed: %s\n", e2.c_str());
+    OpsLog(store, "error", "gateway", "outbox_enqueue_fail",
+           "Không ghi được chấm công vào hàng đợi gửi",
+           {{"user", punch.user_id}, {"detail", e2}});
     return;
   }
   OpsLog(store, "info", "gateway", "punch", "Đã nhận chấm công từ máy",
-         {{"user", punch.user_id}, {"live", punch.from_live ? 1 : 0}});
+         {{"user", punch.user_id},
+          {"live", punch.from_live ? 1 : 0},
+          {"timestamp", punch.timestamp_iso},
+          {"verify_mode", punch.verify_mode},
+          {"inout_mode", punch.inout_mode}});
   std::fprintf(stderr, "[punch] user=%s ts=%s verify=%d inout=%d live=%d\n", punch.user_id.c_str(),
                punch.timestamp_iso.c_str(), punch.verify_mode, punch.inout_mode,
                punch.from_live ? 1 : 0);
@@ -319,11 +376,17 @@ void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Creden
                      "[ingest] INVALID_BODY — retrying id=%lld with minimal body; "
                      "set ingest_minimal=true to make permanent\n",
                      static_cast<long long>(item.id));
+        OpsLog(store, "warn", "ingest", "ingest_minimal_retry",
+               "Server từ chối body đầy đủ — thử gửi tối giản",
+               {{"outbox_id", item.id}});
         r = PostDeviceIngest(cfg, http, cred, raw);
         if (r.ok && r.status == 201) {
           // Replace stored body so future retries stay minimal for this punch.
           store.MarkOutboxOk(item.id, err);
           // Re-mark seen already done; also flip config suggestion only via log.
+          OpsLog(store, "info", "ingest", "ingest_ok",
+                 "Server đã chấp nhận chấm công (body tối giản)",
+                 {{"outbox_id", item.id}, {"minimal", true}});
           std::fprintf(stderr, "[ingest] ok id=%lld status=%ld (minimal)\n",
                        static_cast<long long>(item.id), r.status);
           continue;
@@ -576,16 +639,27 @@ int RunSyncUsers(const Config& cfg_in) {
 
   std::fprintf(stderr, "[users] reading from %s (%s) %s:%d ...\n", tname.c_str(), tid.c_str(),
                tip.c_str(), tport);
+  OpsLog(store, "info", "users", "users_manual_start",
+         "Chạy đồng bộ user id thủ công (--sync-users)",
+         {{"ip", tip}, {"port", tport}, {"name", tname}});
   ZkDevice device;
   device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
   if (!device.Connect(tip, tport, cfg.device_password, cfg.device_timeout_sec, err)) {
     std::fprintf(stderr, "[users] connect fail: %s\n", err.c_str());
+    OpsLog(store, "warn", "zk", "connect_fail",
+           "Không kết nối được máy chấm công khi đồng bộ user id thủ công",
+           {{"ip", tip}, {"port", tport}, {"detail", err}, {"phase", "sync_users_cli"}});
+    FlushOpsLogs(cfg, store, http, cred);
     return 3;
   }
   std::vector<UserRecord> users;
   if (!device.ReadUsers(users, err)) {
     std::fprintf(stderr, "[users] ReadUsers fail: %s\n", err.c_str());
+    OpsLog(store, "warn", "users", "users_read_fail",
+           "Đọc danh sách user id từ máy thất bại (thủ công)",
+           {{"ip", tip}, {"detail", err}});
     device.Disconnect();
+    FlushOpsLogs(cfg, store, http, cred);
     return 4;
   }
   device.Disconnect();
@@ -597,8 +671,10 @@ int RunSyncUsers(const Config& cfg_in) {
   }
 
   if (!SyncMachineUsersCatalog(cfg, store, http, cred, tid, tip, users, /*force=*/true)) {
+    FlushOpsLogs(cfg, store, http, cred);
     return 5;
   }
+  FlushOpsLogs(cfg, store, http, cred);
   std::fprintf(stdout, "OK synced %zu users from %s to %s/checkin/machine-users\n", users.size(),
                tip.c_str(), cfg.base_url.c_str());
   return 0;
@@ -767,9 +843,18 @@ int RunGateway(const Config& cfg_in) {
     if (hr.ok) {
       std::fprintf(stderr, "[heartbeat] ok status=%ld lan_ip=%s terminal_ip=%s\n", hr.status,
                    hb.value("lan_ip", "").c_str(), tip.c_str());
+      OpsLog(store, "info", "heartbeat", "heartbeat_ok",
+             "Heartbeat lên server thành công",
+             {{"lan_ip", hb.value("lan_ip", "")},
+              {"terminal_ip", tip},
+              {"terminal_port", tport},
+              {"http_status", hr.status}});
     } else {
       std::fprintf(stderr, "[heartbeat] fail: %s %s\n", hr.error.c_str(),
                    hr.body.substr(0, 200).c_str());
+      OpsLog(store, "warn", "heartbeat", "heartbeat_fail",
+             "Heartbeat lên server thất bại",
+             {{"detail", (hr.error + " " + hr.body.substr(0, 120)).substr(0, 160)}});
     }
   }
 
@@ -777,10 +862,19 @@ int RunGateway(const Config& cfg_in) {
 
   std::fprintf(stderr,
                "[gateway] start agent=%s version=%s base_url=%s discover=%d terminals=%zu "
-               "attlog_sync=%s live_listen=%d ingest_minimal=%d\n",
+               "attlog_sync=%s users_sync=%s live_listen=%d ingest_minimal=%d\n",
                cfg.agent_name.c_str(), cfg.agent_version.c_str(), cfg.base_url.c_str(),
                cfg.discover_terminals ? 1 : 0, terminals.size(), cfg.attlog_sync_times.c_str(),
-               cfg.live_listen ? 1 : 0, cfg.ingest_minimal ? 1 : 0);
+               cfg.users_sync_times.c_str(), cfg.live_listen ? 1 : 0, cfg.ingest_minimal ? 1 : 0);
+  OpsLog(store, "info", "gateway", "gateway_start",
+         "Dịch vụ checkin-gateway đã khởi động",
+         {{"agent_version", cfg.agent_version},
+          {"base_url", cfg.base_url},
+          {"terminals", terminals.size()},
+          {"attlog_sync_times", cfg.attlog_sync_times},
+          {"users_sync_times", cfg.users_sync_times},
+          {"live_listen", cfg.live_listen}});
+  FlushOpsLogs(cfg, store, http, cred);
 
   // Sync device wall-clock from gateway local time on every service start (DG-600 often
   // boots at 2000-01-01 after power loss).
@@ -847,11 +941,13 @@ int RunGateway(const Config& cfg_in) {
   int64_t last_heartbeat = UnixNow();
   int64_t last_bootstrap = UnixNow();
   std::string last_sync_slot;
+  std::string last_users_sync_slot;
   {
     std::string meta_err;
     store.GetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
+    store.GetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
   }
-  // Never sync ATTLOG on startup — only at local 00:00 and 12:00.
+  // Never sync ATTLOG/users on startup — only at configured local HH:MM slots.
 
   // Persistent RegEvent session on the primary terminal (realtime punches).
   // Do NOT ReadUsers/ATTLOG on this socket — bulk breaks RegEvent on DG-600 until reconnect.
@@ -921,15 +1017,94 @@ int RunGateway(const Config& cfg_in) {
     return true;
   };
 
-  auto sync_terminal_attlog = [&](const TerminalTarget& t) {
+  auto sync_terminal_users = [&](const TerminalTarget& t) {
+    std::string local_err;
+    const std::string tid = t.id.empty() ? t.ip : t.id;
+    std::fprintf(stderr, "[users] sync %s (%s) %s:%d\n", t.name.c_str(), t.id.c_str(), t.ip.c_str(),
+                 t.port);
+
+    std::vector<UserRecord> users;
+    int user_count = -1;
+    bool need_users = true;
+    bool skipped_unchanged = false;
+    {
+      ZkDevice device;
+      device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+        std::fprintf(stderr, "[users] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+        OpsLog(store, "warn", "zk", "connect_fail",
+               "Không kết nối được máy chấm công khi đồng bộ user id",
+               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+                {"phase", "users_sync"}});
+        return;
+      }
+
+      DeviceInfo sizes_info;
+      RawBlob sizes_raw;
+      if (device.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
+        user_count = sizes_info.user_count;
+        std::string count_key = "users_count:" + tid;
+        std::string prev_count;
+        std::string meta_err;
+        store.GetMeta(count_key, prev_count, meta_err);
+        if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
+          std::string fp_key = "users_fp:" + tid;
+          std::string prev_fp;
+          store.GetMeta(fp_key, prev_fp, meta_err);
+          if (!prev_fp.empty()) {
+            need_users = false;
+            skipped_unchanged = true;
+            std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n", t.ip.c_str(),
+                         user_count);
+            OpsLog(store, "info", "users", "users_skip_unchanged",
+                   "Bỏ qua đọc user id từ máy — số lượng không đổi",
+                   {{"ip", t.ip}, {"port", t.port}, {"user_count", user_count}});
+          }
+        }
+      }
+
+      if (need_users) {
+        if (!device.ReadUsers(users, local_err)) {
+          std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+          users.clear();
+          OpsLog(store, "warn", "users", "users_read_fail",
+                 "Đọc danh sách user id từ máy chấm công thất bại",
+                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
+        } else if (user_count < 0) {
+          user_count = static_cast<int>(users.size());
+        }
+      }
+      device.Disconnect();
+    }
+
+    if (!users.empty()) {
+      SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users);
+      std::string meta_err;
+      store.SetMeta("users_count:" + tid, std::to_string(user_count), meta_err);
+    } else if (!skipped_unchanged) {
+      OpsLog(store, "warn", "users", "users_empty",
+             "Không có user id đọc được từ máy để đồng bộ",
+             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}});
+    }
+  };
+
+  auto sync_terminal_attlog = [&](const TerminalTarget& t, bool also_users) {
     DeviceInfo info;
     info.ip = t.ip;
     info.port = t.port;
     std::string local_err;
     const std::string tid = t.id.empty() ? t.ip : t.id;
-    std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s\n", t.name.c_str(), t.id.c_str(),
-                 t.ip.c_str(), t.port,
-                 t.usage_started_on.empty() ? "(today/all)" : t.usage_started_on.c_str());
+    std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s users=%d\n", t.name.c_str(),
+                 t.id.c_str(), t.ip.c_str(), t.port,
+                 t.usage_started_on.empty() ? "(today/all)" : t.usage_started_on.c_str(),
+                 also_users ? 1 : 0);
+    OpsLog(store, "info", "attlog", "attlog_start",
+           "Bắt đầu đồng bộ nhật ký chấm công (ATTLOG) từ máy",
+           {{"ip", t.ip},
+            {"port", t.port},
+            {"name", t.name},
+            {"also_users", also_users},
+            {"usage_started_on", t.usage_started_on}});
 
     // One TCP session for reads only — disconnect ASAP. No RecoverDevice/Enable after bulk
     // (that path froze the DG-600 panel when Enable timed out).
@@ -954,38 +1129,43 @@ int RunGateway(const Config& cfg_in) {
         if (!device.ReadAttendanceLogs(logs, local_err)) {
           std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(),
                        local_err.c_str());
+          OpsLog(store, "warn", "attlog", "attlog_read_fail",
+                 "Đọc nhật ký chấm công từ máy thất bại",
+                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
         } else {
           attlog_ok = true;
         }
 
-        bool need_users = true;
-        DeviceInfo sizes_info;
-        RawBlob sizes_raw;
-        if (device.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
-          user_count = sizes_info.user_count;
-          std::string count_key = "users_count:" + tid;
-          std::string prev_count;
-          std::string meta_err;
-          store.GetMeta(count_key, prev_count, meta_err);
-          if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
-            std::string fp_key = "users_fp:" + tid;
-            std::string prev_fp;
-            store.GetMeta(fp_key, prev_fp, meta_err);
-            if (!prev_fp.empty()) {
-              need_users = false;
-              std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n", t.ip.c_str(),
-                           user_count);
+        if (also_users) {
+          bool need_users = true;
+          DeviceInfo sizes_info;
+          RawBlob sizes_raw;
+          if (device.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
+            user_count = sizes_info.user_count;
+            std::string count_key = "users_count:" + tid;
+            std::string prev_count;
+            std::string meta_err;
+            store.GetMeta(count_key, prev_count, meta_err);
+            if (!prev_count.empty() && prev_count == std::to_string(user_count)) {
+              std::string fp_key = "users_fp:" + tid;
+              std::string prev_fp;
+              store.GetMeta(fp_key, prev_fp, meta_err);
+              if (!prev_fp.empty()) {
+                need_users = false;
+                std::fprintf(stderr, "[users] %s skip ReadUsers (count=%d unchanged)\n",
+                             t.ip.c_str(), user_count);
+              }
             }
           }
-        }
 
-        if (need_users) {
-          if (!device.ReadUsers(users, local_err)) {
-            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
-            users.clear();
-          } else {
-            users_pulled = true;
-            if (user_count < 0) user_count = static_cast<int>(users.size());
+          if (need_users) {
+            if (!device.ReadUsers(users, local_err)) {
+              std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+              users.clear();
+            } else {
+              users_pulled = true;
+              if (user_count < 0) user_count = static_cast<int>(users.size());
+            }
           }
         }
 
@@ -1025,6 +1205,10 @@ int RunGateway(const Config& cfg_in) {
     store.GetMeta(fp_key, prev_fp, meta_err);
     if (!prev_fp.empty() && prev_fp == fp) {
       std::fprintf(stderr, "[attlog] %s unchanged fp=%s (skip ingest)\n", t.ip.c_str(), fp.c_str());
+      OpsLog(store, "info", "attlog", "attlog_unchanged",
+             "Nhật ký chấm công không đổi — bỏ qua gửi lên server",
+             {{"ip", t.ip}, {"port", t.port}, {"raw", logs.size()}, {"filtered", filtered.size()},
+              {"fp", fp}});
       return;
     }
 
@@ -1037,6 +1221,15 @@ int RunGateway(const Config& cfg_in) {
     store.SetMeta(fp_key, fp, meta_err);
     std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d fp=%s\n", t.ip.c_str(),
                  filtered.size(), logs.size(), enq, fp.c_str());
+    OpsLog(store, "info", "attlog", "attlog_enqueued",
+           "Đã đưa nhật ký chấm công vào hàng đợi gửi lên server",
+           {{"ip", t.ip},
+            {"port", t.port},
+            {"name", t.name},
+            {"raw", logs.size()},
+            {"filtered", filtered.size()},
+            {"enqueued", enq},
+            {"fp", fp}});
 
     // Durable locally before clearing device buffer.
     FlushOutbox(cfg, store, http, cred);
@@ -1050,8 +1243,14 @@ int RunGateway(const Config& cfg_in) {
           std::fprintf(stderr, "[attlog] %s cleared device ATTLOG after enqueue=%d\n", t.ip.c_str(),
                        enq);
           store.SetMeta(fp_key, FingerprintEvents({}), meta_err);
+          OpsLog(store, "info", "attlog", "attlog_cleared",
+                 "Đã xóa nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
+                 {{"ip", t.ip}, {"enqueued", enq}});
         } else {
           std::fprintf(stderr, "[attlog] %s clear failed: %s\n", t.ip.c_str(), local_err.c_str());
+          OpsLog(store, "warn", "attlog", "attlog_clear_fail",
+                 "Xóa nhật ký chấm công trên máy thất bại",
+                 {{"ip", t.ip}, {"detail", local_err}});
         }
         clearer.Disconnect();
       }
@@ -1085,23 +1284,59 @@ int RunGateway(const Config& cfg_in) {
       auto hr = SignedRequest(cfg, http, cred, "PUT", "/device-identity/heartbeat", hb.dump());
       if (!hr.ok) {
         std::fprintf(stderr, "[heartbeat] fail: %s\n", hr.error.c_str());
+        OpsLog(store, "warn", "heartbeat", "heartbeat_fail",
+               "Heartbeat định kỳ lên server thất bại",
+               {{"detail", hr.error}, {"terminal_ip", tip}, {"terminal_port", tport}});
+      } else {
+        OpsLog(store, "info", "heartbeat", "heartbeat_ok",
+               "Heartbeat định kỳ lên server thành công",
+               {{"terminal_ip", tip}, {"terminal_port", tport}, {"http_status", hr.status}});
       }
     }
 
     std::string slot = CurrentAttlogSyncSlot(cfg.attlog_sync_times);
-    if (!slot.empty() && slot != last_sync_slot && !terminals.empty()) {
-      // Drop live session before bulk ATTLOG — RegEvent breaks after USERTEMP/ATTLOG on DG-600.
+    std::string users_slot = CurrentAttlogSyncSlot(cfg.users_sync_times);
+    const bool attlog_due = !slot.empty() && slot != last_sync_slot && !terminals.empty();
+    const bool users_due =
+        !users_slot.empty() && users_slot != last_users_sync_slot && !terminals.empty();
+    // Same HH:MM window: one TCP session does ATTLOG + users (avoids double disconnect on DG-600).
+    const bool users_with_attlog = attlog_due && users_due && slot == users_slot;
+
+    if (attlog_due) {
       live_device.Disconnect();
-      std::fprintf(stderr, "[attlog] scheduled sync slot=%s terminals=%zu\n", slot.c_str(),
-                   terminals.size());
+      std::fprintf(stderr, "[attlog] scheduled sync slot=%s terminals=%zu users=%d\n", slot.c_str(),
+                   terminals.size(), users_with_attlog ? 1 : 0);
+      OpsLog(store, "info", "attlog", "attlog_slot",
+             "Tới khung giờ đồng bộ ATTLOG",
+             {{"slot", slot}, {"terminals", terminals.size()}, {"with_users", users_with_attlog}});
       for (const auto& t : terminals) {
         if (!g_running) break;
-        sync_terminal_attlog(t);
+        sync_terminal_attlog(t, /*also_users=*/users_with_attlog);
         FlushOutbox(cfg, store, http, cred);
       }
       last_sync_slot = slot;
       std::string meta_err;
       store.SetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
+      if (users_with_attlog) {
+        last_users_sync_slot = users_slot;
+        store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
+      }
+      FlushOpsLogs(cfg, store, http, cred);
+    } else if (users_due) {
+      live_device.Disconnect();
+      std::fprintf(stderr, "[users] scheduled sync slot=%s terminals=%zu\n", users_slot.c_str(),
+                   terminals.size());
+      OpsLog(store, "info", "users", "users_slot",
+             "Tới khung giờ đồng bộ user id",
+             {{"slot", users_slot}, {"terminals", terminals.size()}});
+      for (const auto& t : terminals) {
+        if (!g_running) break;
+        sync_terminal_users(t);
+      }
+      last_users_sync_slot = users_slot;
+      std::string meta_err;
+      store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
+      FlushOpsLogs(cfg, store, http, cred);
     }
 
     FlushOutbox(cfg, store, http, cred);
@@ -1149,6 +1384,8 @@ int RunGateway(const Config& cfg_in) {
   }
 
   live_device.Disconnect();
+  OpsLog(store, "info", "gateway", "gateway_stop", "Dịch vụ checkin-gateway đang dừng", {});
+  FlushOpsLogs(cfg, store, http, cred);
   std::fprintf(stderr, "[gateway] stopped\n");
   return 0;
 }

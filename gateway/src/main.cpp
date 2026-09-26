@@ -206,7 +206,10 @@ int main(int argc, char** argv) {
     std::fprintf(stdout, "device_ip=%s\n", cfg.device_ip.c_str());
     std::fprintf(stdout, "device_port=%d\n", cfg.device_port);
     std::fprintf(stdout, "discover_terminals=%s\n", cfg.discover_terminals ? "true" : "false");
-    std::fprintf(stdout, "attlog_sync=00:00,12:00 local\n");
+    std::fprintf(stdout, "attlog_sync=%s\n",
+                 cfg.attlog_sync_times.empty() ? "00:00,12:00" : cfg.attlog_sync_times.c_str());
+    std::fprintf(stdout, "users_sync=%s\n",
+                 cfg.users_sync_times.empty() ? "00:00,12:00" : cfg.users_sync_times.c_str());
     std::fprintf(stdout, "enrolled=%s\n", enrolled ? "true" : "false");
     if (enrolled) std::fprintf(stdout, "device_id=%s\n", device_id.c_str());
     return 0;

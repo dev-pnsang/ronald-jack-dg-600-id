@@ -33,6 +33,8 @@ struct Config {
   int catalog_refresh_sec = 300;      // refresh terminal list only (no ATTLOG)
   // Local HH:MM slots for ATTLOG bulk sync (comma-separated, from bootstrap)
   std::string attlog_sync_times = "00:00,12:00";
+  // Local HH:MM slots for machine user-id catalog sync (independent of ATTLOG)
+  std::string users_sync_times = "00:00,12:00";
   int bootstrap_refresh_sec = 300;
   int poll_interval_sec = 43200;     // unused — ATTLOG at 00:00 & 12:00 only
   bool ingest_minimal = false;     // only attendance_code + timestamp

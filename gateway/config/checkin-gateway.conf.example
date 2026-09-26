@@ -25,6 +25,8 @@ poll_fallback=false
 discover_terminals=true
 catalog_refresh_sec=300
 attlog_sync_times=00:00,12:00
+# Machine user-id catalog (PUT /checkin/machine-users). May differ from ATTLOG, e.g. 06:00
+users_sync_times=00:00,12:00
 bootstrap_refresh_sec=300
 poll_interval_sec=43200
 

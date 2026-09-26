@@ -55,6 +55,7 @@ bool LoadConfig(const std::string& path, Config& out, std::string& err) {
       else if (key == "discover_terminals") out.discover_terminals = ParseBool(val, true);
       else if (key == "catalog_refresh_sec") out.catalog_refresh_sec = std::stoi(val);
       else if (key == "attlog_sync_times") out.attlog_sync_times = val;
+      else if (key == "users_sync_times") out.users_sync_times = val;
       else if (key == "bootstrap_refresh_sec") out.bootstrap_refresh_sec = std::stoi(val);
       else if (key == "poll_interval_sec") out.poll_interval_sec = std::stoi(val);
       else if (key == "ingest_minimal") out.ingest_minimal = ParseBool(val, false);

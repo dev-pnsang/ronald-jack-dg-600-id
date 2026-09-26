@@ -111,6 +111,15 @@ Log tốt: `[catalog]`, `[heartbeat] ok`, `[bootstrap] ok`, `[zk] live listen ON
 
 Trên Device Monitor (ops logs tiếng Việt): `terminal_matched` / `connect_ok` khi catalog trùng IP:port local và ZK kết nối được; `connect_fail` nếu LAN tới máy chấm lỗi.
 
+Lịch đồng bộ (giờ local trên gateway, cửa sổ ~90s đầu HH:MM):
+
+| Key | Việc | Mặc định |
+|-----|------|----------|
+| `attlog_sync_times` | Kéo ATTLOG → ingest | `00:00,12:00` |
+| `users_sync_times` | Kéo user id → `/checkin/machine-users` | `00:00,12:00` (có thể khác, vd. `06:00`) |
+
+Chạy tay user: `sudo checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --sync-users`
+
 ## OTA (cập nhật từ xa)
 
 Sau khi có `.deb` / `.tar.gz` (gzip) + SHA-256 trên HTTPS:

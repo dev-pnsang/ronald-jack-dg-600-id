@@ -32,7 +32,10 @@ sudo checkin-gatewayctl status
 ```
 
 Service uses `/etc/checkin-gateway/checkin-gateway.conf` and state in `/var/lib/checkin-gateway`.
-ATTLOG sync runs at local **00:00** and **12:00** only (from `usage_started_on`).
+- **ATTLOG** (nhật ký chấm công): `attlog_sync_times` — mặc định local **00:00,12:00**
+- **User id** (`PUT /checkin/machine-users`): `users_sync_times` — mặc định giống ATTLOG; có thể đặt khác (vd. `06:00`)
+
+One-shot user sync: `checkin-gateway --config … --sync-users`
 
 ## Source of truth
 
