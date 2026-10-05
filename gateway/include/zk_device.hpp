@@ -101,7 +101,12 @@ class ZkDevice {
   // Soft EnableDevice only (short timeout). Prefer Disconnect after bulk — do not call
   // RecoverDevice on the success path (Enable after large ATTLOG times out and freezes UI).
   bool RecoverDevice(std::string& err);
-  // Clear attendance buffer on device after successful local enqueue (keeps next pull small).
+  // CMD_STATE_RRQ. Restores the session id (this firmware returns the state in that field).
+  // enabled is fingerprint enrollment (1) or identification (2).
+  bool ReadAttendanceSensor(bool& enabled, int& state, std::string& err);
+  // If the sensor is waiting (state 0), one CMD_ENABLEDEVICE. No Disable, no retry.
+  bool EnsureAttendanceSensor(std::string& err);
+  // Always refuses. Attendance on the device is never deleted.
   bool ClearAttendanceLogs(std::string& err);
 
   bool GetTime(DeviceTime& out, std::string& err);

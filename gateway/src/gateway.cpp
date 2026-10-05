@@ -1117,7 +1117,6 @@ int RunGateway(const Config& cfg_in) {
     // One TCP session for reads only — disconnect ASAP. No RecoverDevice/Enable after bulk
     // (that path froze the DG-600 panel when Enable timed out).
     std::vector<AttendanceEvent> logs;
-    bool attlog_ok = false;
     std::vector<UserRecord> users;
     bool users_pulled = false;
     int user_count = -1;
@@ -1140,8 +1139,6 @@ int RunGateway(const Config& cfg_in) {
           OpsLog(store, "warn", "attlog", "attlog_read_fail",
                  "Đọc nhật ký chấm công từ máy thất bại",
                  {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
-        } else {
-          attlog_ok = true;
         }
 
         if (also_users) {
@@ -1221,14 +1218,19 @@ int RunGateway(const Config& cfg_in) {
     }
 
     int enq = 0;
+    int already = 0;
     for (auto& ev : filtered) {
       ev.from_live = false;
+      if (store.SeenDedupe(DedupeKey(ev))) {
+        ++already;
+        continue;
+      }
       EnqueuePunch(store, cfg, info, ev);
       ++enq;
     }
     store.SetMeta(fp_key, fp, meta_err);
-    std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d fp=%s\n", t.ip.c_str(),
-                 filtered.size(), logs.size(), enq, fp.c_str());
+    std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d already=%d fp=%s\n",
+                 t.ip.c_str(), filtered.size(), logs.size(), enq, already, fp.c_str());
     OpsLog(store, "info", "attlog", "attlog_enqueued",
            "Đã đưa nhật ký chấm công vào hàng đợi gửi lên server",
            {{"ip", t.ip},
@@ -1237,32 +1239,15 @@ int RunGateway(const Config& cfg_in) {
             {"raw", logs.size()},
             {"filtered", filtered.size()},
             {"enqueued", enq},
+            {"already_seen", already},
             {"fp", fp}});
 
-    // Durable locally before clearing device buffer.
+    // Local outbox only. The device ATTLOG is left intact.
     FlushOutbox(cfg, store, http, cred);
-
-    // Light reconnect for CLEAR only (no bulk) — keeps next slot small.
-    if (attlog_ok) {
-      ZkDevice clearer;
-      clearer.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-      if (clearer.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
-        if (clearer.ClearAttendanceLogs(local_err)) {
-          std::fprintf(stderr, "[attlog] %s cleared device ATTLOG after enqueue=%d\n", t.ip.c_str(),
-                       enq);
-          store.SetMeta(fp_key, FingerprintEvents({}), meta_err);
-          OpsLog(store, "info", "attlog", "attlog_cleared",
-                 "Đã xóa nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
-                 {{"ip", t.ip}, {"enqueued", enq}});
-        } else {
-          std::fprintf(stderr, "[attlog] %s clear failed: %s\n", t.ip.c_str(), local_err.c_str());
-          OpsLog(store, "warn", "attlog", "attlog_clear_fail",
-                 "Xóa nhật ký chấm công trên máy thất bại",
-                 {{"ip", t.ip}, {"detail", local_err}});
-        }
-        clearer.Disconnect();
-      }
-    }
+    std::fprintf(stderr, "[attlog] %s kept device ATTLOG after enqueue=%d\n", t.ip.c_str(), enq);
+    OpsLog(store, "info", "attlog", "attlog_kept",
+           "Giữ nguyên nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
+           {{"ip", t.ip}, {"enqueued", enq}});
   };
 
   while (g_running) {

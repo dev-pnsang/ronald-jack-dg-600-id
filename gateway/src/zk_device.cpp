@@ -41,6 +41,7 @@ constexpr uint16_t CMD_DEVICE = 11;
 constexpr uint16_t CMD_GET_TIME = 201;
 constexpr uint16_t CMD_SET_TIME = 202;
 constexpr uint16_t CMD_GET_FREE_SIZES = 50;
+constexpr uint16_t CMD_STATE_RRQ = 64;
 constexpr uint16_t CMD_REFRESHDATA = 1013;
 constexpr uint16_t CMD_REG_EVENT = 500;
 constexpr int32_t FCT_USER = 5;
@@ -386,6 +387,13 @@ bool ZkDevice::RecvPacket(std::vector<uint8_t>& payload, uint16_t& command, std:
 bool ZkDevice::SendCommand(uint16_t command, const std::vector<uint8_t>& data,
                            std::vector<uint8_t>& reply, uint16_t& reply_cmd, std::string& err,
                            int timeout_ms) {
+  if (command == CMD_CLEAR_ATTLOG || command == CMD_DISABLEDEVICE) {
+    err = command == CMD_CLEAR_ATTLOG
+              ? "refused: CMD_CLEAR_ATTLOG is forbidden — attendance on the device is never deleted"
+              : "refused: CMD_DISABLEDEVICE is forbidden — do not turn the attendance sensor off";
+    LogWarning(err);
+    return false;
+  }
   auto packet = MakePacket(command, session_id_, reply_id_, data);
   size_t sent = 0;
   while (sent < packet.size()) {
@@ -450,10 +458,71 @@ bool ZkDevice::Authenticate(int password, std::string& err) {
 }
 
 bool ZkDevice::EnableDevice(bool enable, std::string& err, int timeout_ms) {
+  if (!enable) {
+    err = "refused: turning the attendance sensor off is forbidden";
+    LogWarning(err);
+    return false;
+  }
   std::vector<uint8_t> reply;
   uint16_t cmd = 0;
-  return SendCommand(enable ? CMD_ENABLEDEVICE : CMD_DISABLEDEVICE, {}, reply, cmd, err,
-                     timeout_ms > 0 ? timeout_ms : 5000);
+  return SendCommand(CMD_ENABLEDEVICE, {}, reply, cmd, err, timeout_ms > 0 ? timeout_ms : 5000);
+}
+
+bool ZkDevice::ReadAttendanceSensor(bool& enabled, int& state, std::string& err) {
+  enabled = false;
+  state = -1;
+  if (fd_ < 0) {
+    err = "not connected";
+    return false;
+  }
+  // This firmware writes the state into the session-id field. Keep the real session.
+  const uint16_t saved_session = session_id_;
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  const bool ok = SendCommand(CMD_STATE_RRQ, {}, reply, cmd, err, 1500);
+  state = static_cast<int>(session_id_);
+  session_id_ = saved_session;
+  if (!ok || cmd != CMD_ACK_OK) {
+    if (err.empty()) err = "STATE_RRQ failed reply_cmd=" + std::to_string(cmd);
+    return false;
+  }
+  // 1 = fingerprint enrollment, 2 = fingerprint identification (attendance).
+  enabled = (state == 1 || state == 2);
+  err.clear();
+  return true;
+}
+
+bool ZkDevice::EnsureAttendanceSensor(std::string& err) {
+  bool enabled = false;
+  int state = -1;
+  if (!ReadAttendanceSensor(enabled, state, err)) {
+    LogWarning("Attendance sensor status unreadable: " + err);
+    return false;
+  }
+  if (enabled) {
+    LogInfo("Attendance sensor already on (state=" + std::to_string(state) + ")");
+    err.clear();
+    return true;
+  }
+  // Menu, busy, or card-write: one more Enable here can freeze the panel.
+  if (state == 3 || state == 4 || state == 5) {
+    LogInfo("Attendance panel busy (state=" + std::to_string(state) + ") — not sending Enable");
+    err.clear();
+    return true;
+  }
+  if (state != 0) {
+    LogInfo("Attendance sensor state " + std::to_string(state) + " — not sending Enable");
+    err.clear();
+    return true;
+  }
+  // State 0 = waiting, not identifying. One short Enable, no retry.
+  LogInfo("Attendance sensor is not identifying — enabling once");
+  if (!EnableDevice(true, err, 1500)) {
+    LogWarning("Enable attendance sensor failed (not retried): " + err);
+    return false;
+  }
+  err.clear();
+  return true;
 }
 
 bool ZkDevice::RecoverDevice(std::string& err) {
@@ -472,23 +541,11 @@ bool ZkDevice::RecoverDevice(std::string& err) {
 }
 
 bool ZkDevice::ClearAttendanceLogs(std::string& err) {
-  if (!connected_) {
-    err = "not connected";
-    return false;
-  }
-  // pyzk clear_attendance sends CMD_CLEAR_ATTLOG without DisableDevice / RecoverDevice.
-  std::vector<uint8_t> reply;
-  uint16_t cmd = 0;
-  bool ok = SendCommand(CMD_CLEAR_ATTLOG, {}, reply, cmd, err, 10000);
-  if (ok) {
-    std::string e_ref;
-    uint16_t rcmd = 0;
-    SendCommand(CMD_REFRESHDATA, {}, reply, rcmd, e_ref, 3000);
-    LogInfo("ClearAttendanceLogs ok");
-  } else {
-    LogWarning("ClearAttendanceLogs failed: " + err);
-  }
-  return ok;
+  // Never send CMD_CLEAR_ATTLOG. The terminal log is the source of record.
+  // Dedup belongs in the local seen table, not by wiping the device.
+  err = "refused: attendance log on the device must not be deleted";
+  LogWarning(err);
+  return false;
 }
 
 bool ZkDevice::GetString(uint16_t /*command*/, const std::string& param, std::string& value,
@@ -575,7 +632,12 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
     return false;
   }
   std::string e2;
-  EnableDevice(true, e2, 2000);  // best-effort, short timeout — do not block panel
+  if (!EnsureAttendanceSensor(e2)) {
+    LogError("Attendance sensor check failed: " + e2);
+    CloseSocket();
+    err = e2;
+    return false;
+  }
   connected_ = true;
   info_.ip = ip_;
   info_.port = port_;
@@ -662,18 +724,17 @@ bool ZkDevice::ReadFreeSizes(DeviceInfo& info, RawBlob& raw, std::string& err) {
   raw.reply_cmd = cmd;
   raw.bytes = reply;
   raw.status = reply.empty() ? "empty" : "ok";
-  // pyzk layout: various offsets; common: users at 4, fingers at 24? — parse cautiously
-  // ZK free sizes typically 92+ bytes. Users count often at offset 4 (u32), records at 8 or similar.
-  if (reply.size() >= 8) {
-    info.user_count = static_cast<int>(ReadU32(reply.data() + 4));
-  }
-  if (reply.size() >= 16) {
-    info.finger_count = static_cast<int>(ReadU32(reply.data() + 8));
-  }
+  // ZK status block on this DG-600: user count at 16, fingerprints at 24, ATTLOG at 32.
+  // Offsets 4/8/12 are zero. Reading those made the catalog look empty and skipped sync.
   if (reply.size() >= 20) {
-    info.log_count = static_cast<int>(ReadU32(reply.data() + 12));
+    info.user_count = static_cast<int>(ReadU32(reply.data() + 16));
   }
-  // Some firmwares use different packing; keep raw always.
+  if (reply.size() >= 28) {
+    info.finger_count = static_cast<int>(ReadU32(reply.data() + 24));
+  }
+  if (reply.size() >= 36) {
+    info.log_count = static_cast<int>(ReadU32(reply.data() + 32));
+  }
   return true;
 }
 
