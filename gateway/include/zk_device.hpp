@@ -84,7 +84,10 @@ class ZkDevice {
   ZkDevice(const ZkDevice&) = delete;
   ZkDevice& operator=(const ZkDevice&) = delete;
 
-  bool Connect(const std::string& ip, int port, int password, int timeout_sec, std::string& err);
+  // allow_sensor_enable: state 0 may send one Enable. Pass false on the live
+  // session opened right after an ATTLOG/user pull, and on the 15-minute probe.
+  bool Connect(const std::string& ip, int port, int password, int timeout_sec, std::string& err,
+               bool allow_sensor_enable = true);
   void Disconnect();
   void SetTzOffsetMinutes(int offset_min) { tz_offset_min_ = offset_min; }
   bool IsConnected() const { return connected_; }
@@ -104,8 +107,9 @@ class ZkDevice {
   // CMD_STATE_RRQ. Restores the session id (this firmware returns the state in that field).
   // enabled is fingerprint enrollment (1) or identification (2).
   bool ReadAttendanceSensor(bool& enabled, int& state, std::string& err);
-  // If the sensor is waiting (state 0), one CMD_ENABLEDEVICE. No Disable, no retry.
-  bool EnsureAttendanceSensor(std::string& err);
+  // If allow_enable and the sensor is waiting (state 0), one CMD_ENABLEDEVICE.
+  // No Disable, no retry. allow_enable false still reads state and never Enables.
+  bool EnsureAttendanceSensor(std::string& err, bool allow_enable = true);
   // Always refuses. Attendance on the device is never deleted.
   bool ClearAttendanceLogs(std::string& err);
 
@@ -137,6 +141,8 @@ class ZkDevice {
   bool RecvPacket(std::vector<uint8_t>& payload, uint16_t& command, std::string& err, int timeout_ms);
   bool CreateSocket(std::string& err);
   void CloseSocket();
+  // CMD_EXIT then close. Used when handshake succeeded but Connect is aborting.
+  void ReleaseSession();
   bool Handshake(std::string& err);
   bool Authenticate(int password, std::string& err);
   bool EnableDevice(bool enable, std::string& err, int timeout_ms = 5000);

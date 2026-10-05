@@ -271,12 +271,20 @@ bool Store::MarkOutboxFail(int64_t id, const std::string& error, int64_t next_at
 }
 
 bool Store::AbandonOutbox(int64_t id, const std::string& error, std::string& err) {
-  // Mark seen so we don't re-enqueue same punch; drop from outbox.
-  std::string e2;
-  if (!MarkOutboxFail(id, error, UnixNow() + 365LL * 24 * 3600, e2)) {
-    // still try to move to seen
+  // The device ATTLOG is still the source. Delete the row and leave `seen` alone
+  // so the next scheduled sync can enqueue this punch again.
+  (void)error;
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), "DELETE FROM outbox WHERE id=?", -1, &st,
+                         nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
+    return false;
   }
-  return MarkOutboxOk(id, err);
+  sqlite3_bind_int64(st, 1, id);
+  bool ok = sqlite3_step(st) == SQLITE_DONE;
+  if (!ok) err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
+  sqlite3_finalize(st);
+  return ok;
 }
 
 int Store::Prune(int64_t older_than_unix, std::string& err) {

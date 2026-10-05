@@ -46,7 +46,7 @@ class Store {
   std::vector<OutboxItem> DueOutbox(int limit, int64_t now, int max_attempts);
   bool MarkOutboxOk(int64_t id, std::string& err);
   bool MarkOutboxFail(int64_t id, const std::string& error, int64_t next_attempt_at, std::string& err);
-  // Move exhausted retries out of active outbox (keep dedupe in seen).
+  // Drop an exhausted outbox row. Does not mark seen, so the next ATTLOG sync can enqueue it again.
   bool AbandonOutbox(int64_t id, const std::string& error, std::string& err);
 
   // Delete seen rows and abandoned outbox older than cutoff (unix seconds).

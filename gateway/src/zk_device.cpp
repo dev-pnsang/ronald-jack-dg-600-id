@@ -331,6 +331,17 @@ void ZkDevice::CloseSocket() {
   }
 }
 
+void ZkDevice::ReleaseSession() {
+  if (fd_ < 0) return;
+  std::string err;
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  if (!SendCommand(CMD_EXIT, {}, reply, cmd, err, 2000)) {
+    LogWarning("CMD_EXIT before close failed: " + err);
+  }
+  CloseSocket();
+}
+
 bool ZkDevice::RecvPacket(std::vector<uint8_t>& payload, uint16_t& command, std::string& err,
                           int timeout_ms) {
   payload.clear();
@@ -492,12 +503,17 @@ bool ZkDevice::ReadAttendanceSensor(bool& enabled, int& state, std::string& err)
   return true;
 }
 
-bool ZkDevice::EnsureAttendanceSensor(std::string& err) {
+bool ZkDevice::EnsureAttendanceSensor(std::string& err, bool allow_enable) {
   bool enabled = false;
   int state = -1;
   if (!ReadAttendanceSensor(enabled, state, err)) {
     LogWarning("Attendance sensor status unreadable: " + err);
     return false;
+  }
+  if (!allow_enable) {
+    LogInfo("Enable suppressed on this session (state=" + std::to_string(state) + ")");
+    err.clear();
+    return true;
   }
   if (enabled) {
     LogInfo("Attendance sensor already on (state=" + std::to_string(state) + ")");
@@ -610,7 +626,7 @@ DeviceOptionResult ZkDevice::ProbeOption(const std::string& key) {
 }
 
 bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeout_sec,
-                       std::string& err) {
+                       std::string& err, bool allow_sensor_enable) {
   Disconnect();
   ip_ = ip;
   port_ = port;
@@ -628,13 +644,13 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
   }
   if (!Authenticate(password, err)) {
     LogError("Authentication failed: " + err);
-    CloseSocket();
+    ReleaseSession();
     return false;
   }
   std::string e2;
-  if (!EnsureAttendanceSensor(e2)) {
+  if (!EnsureAttendanceSensor(e2, allow_sensor_enable)) {
     LogError("Attendance sensor check failed: " + e2);
-    CloseSocket();
+    ReleaseSession();
     err = e2;
     return false;
   }
@@ -971,19 +987,6 @@ bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext
 
 bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,
                                    RawBlob& raw, std::string& err) {
-  auto reconnect = [&](std::string& e) -> bool {
-    const std::string ip = ip_;
-    const int port = port_;
-    const int pw = password_;
-    const int to = timeout_sec_;
-    Disconnect();
-    if (!Connect(ip, port, pw, to, e)) {
-      e = "reconnect before fallback: " + e;
-      return false;
-    }
-    return true;
-  };
-
   auto keep_raw = [&](bool ok) {
     if (ok && !raw.bytes.empty()) {
       const char* label = "bulk";
@@ -994,30 +997,18 @@ bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vec
     return ok;
   };
 
-  // DG-600 READ_BUFFER often returns ~1KiB chunks. For large ATTLOG that means hundreds of
-  // RTTs (panel lag). Prefer continuous PREPARE_DATA stream for attendance.
+  // One attempt on the session already open. A second connect runs EnsureAttendanceSensor
+  // and can send Enable; repeating that is what froze the DG-600 panel.
+  // Attendance uses the continuous stream. User records use the buffered read.
   if (command == CMD_ATTLOG_RRQ) {
     if (keep_raw(FetchLargeData(command, legacy_req, raw, err))) return true;
-    LogWarning("stream attlog failed, try buffered: " + err);
-    std::string e_re;
-    if (!reconnect(e_re)) {
-      err = e_re;
-      return false;
-    }
-    return keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, err));
-  }
-
-  std::string buf_err;
-  if (keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, buf_err))) {
-    return true;
-  }
-  LogWarning("buffered read failed, fallback stream: " + buf_err);
-  std::string e_re;
-  if (!reconnect(e_re)) {
-    err = e_re;
+    LogWarning("stream attlog failed, not reconnecting: " + err);
     return false;
   }
-  return keep_raw(FetchLargeData(command, legacy_req, raw, err));
+
+  if (keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, err))) return true;
+  LogWarning("buffered read failed, not reconnecting: " + err);
+  return false;
 }
 
 
@@ -1069,6 +1060,30 @@ bool ZkDevice::ReadUsers(std::vector<UserRecord>& out, std::string& err) {
   return ReadUsersRaw(out, raw, err);
 }
 
+int MaxSanePunchYear() {
+  std::time_t now = std::time(nullptr);
+  std::tm tmb{};
+  localtime_r(&now, &tmb);
+  return tmb.tm_year + 1900 + 1;
+}
+
+bool SanePunchYear(int year) { return year >= 2020 && year <= MaxSanePunchYear(); }
+
+// DG-600 PIN is 1–9 digits at the start of the field, then NUL. Binary noise is not a PIN.
+std::string LeadingPin(const uint8_t* p, size_t len) {
+  std::string id;
+  size_t i = 0;
+  const size_t cap = len < 9 ? len : 9;
+  for (; i < cap; ++i) {
+    if (p[i] == 0) break;
+    if (p[i] < '0' || p[i] > '9') return {};
+    id.push_back(static_cast<char>(p[i]));
+  }
+  if (id.empty()) return {};
+  if (i < len && p[i] != 0) return {};
+  return id;
+}
+
 bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob& raw,
                                      std::string& err) {
   out.clear();
@@ -1100,49 +1115,59 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
     StartLiveCapture(e2);
   }
 
+  const size_t n = raw.bytes.size();
+  // This DG-600 stores 40-byte SSR rows (24-byte PIN, time at byte 24).
+  // A short or 16-byte reading is a failed pull, not an empty log.
+  if (n == 0) {
+    LogInfo("ATTLOG empty");
+    return true;
+  }
+  if (n < 40 || n % 40 != 0) {
+    err = "ATTLOG size " + std::to_string(n) + " is not a whole 40-byte table";
+    LogWarning(err + "; refusing to invent punches");
+    return false;
+  }
   const size_t rec = 40;
+  const size_t time_off = 24;
+  const size_t pin_len = 24;
+
   std::string received = UtcNowIso8601();
-  for (size_t off = 0; off + 16 <= raw.bytes.size();) {
-    size_t step = (off + rec <= raw.bytes.size()) ? rec : 16;
+  int kept = 0;
+  int dropped = 0;
+  for (size_t off = 0; off + rec <= n; off += rec) {
     const uint8_t* p = raw.bytes.data() + off;
+    std::string pin = LeadingPin(p, pin_len);
+    if (pin.empty() || pin == "0") {
+      ++dropped;
+      continue;
+    }
+    uint32_t t = ReadU32(p + time_off);
     AttendanceEvent ev;
     ev.from_live = false;
     ev.received_at_iso = received;
-
-    char uidstr[28] = {};
-    std::memcpy(uidstr, p, 24);
-    ev.user_id = CleanTextField(p, 24);
-    size_t time_off = 24;
-    if (ev.user_id.empty()) {
-      uint16_t uid = ReadU16(p);
-      if (uid == 0) {
-        off += step;
-        continue;
-      }
-      ev.user_id = std::to_string(uid);
-      time_off = 4;
-      step = 16;
-    }
-    if (time_off + 4 > raw.bytes.size() - off) break;
-    uint32_t t = ReadU32(p + time_off);
-    if (!DecodeZkTime(t, ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second)) {
-      off += step;
+    ev.user_id = pin;
+    if (!DecodeZkTime(t, ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second) ||
+        !SanePunchYear(ev.year)) {
+      ++dropped;
       continue;
     }
-    ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second, tz_offset_min_);
-    if (time_off + 4 < step) ev.verify_mode = p[time_off + 4];
-    if (time_off + 5 < step) ev.inout_mode = p[time_off + 5];
-    if (time_off + 6 < step) ev.work_code = p[time_off + 6];
-    ev.raw_hex = BytesToHex(p, step);
+    ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second,
+                                           tz_offset_min_);
+    if (time_off + 4 < rec) ev.verify_mode = p[time_off + 4];
+    if (time_off + 5 < rec) ev.inout_mode = p[time_off + 5];
+    if (time_off + 6 < rec) ev.work_code = p[time_off + 6];
+    ev.raw_hex = BytesToHex(p, rec);
     for (const auto& u : users_cache_) {
       if (u.user_id == ev.user_id) {
         ev.user_name = u.name;
         break;
       }
     }
-    if (!ev.user_id.empty() && ev.user_id != "0") out.push_back(ev);
-    off += step;
+    out.push_back(std::move(ev));
+    ++kept;
   }
+  LogInfo("ATTLOG parsed kept=" + std::to_string(kept) + " dropped=" + std::to_string(dropped) +
+          " rec=" + std::to_string(rec));
   return true;
 }
 
@@ -1202,26 +1227,14 @@ bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& 
     if (data[i] >= 32 && data[i] < 127) uid.push_back(static_cast<char>(data[i]));
     else break;
   }
-  if (uid.empty() && data.size() >= 2) {
-    uid = std::to_string(ReadU16(data.data()));
-    i = 2;
-  }
   ev.user_id = CleanText(uid);
+  if (ev.user_id.empty() || ev.user_id == "0") return false;
+  for (unsigned char c : ev.user_id) {
+    if (c < '0' || c > '9') return false;
+  }
 
-  auto fill_local_now = [&]() {
-    std::time_t now = std::time(nullptr);
-    std::tm tmb{};
-    localtime_r(&now, &tmb);
-    ev.year = tmb.tm_year + 1900;
-    ev.month = tmb.tm_mon + 1;
-    ev.day = tmb.tm_mday;
-    ev.hour = tmb.tm_hour;
-    ev.minute = tmb.tm_min;
-    ev.second = tmb.tm_sec;
-  };
-
-  // DG-600 live packets often pad PIN to 24 bytes; time at offset 8 is zeros → year 2000.
-  // Try candidates: after UID, fixed 24 (SSR pad), then 8. Reject year < 2020.
+  // DG-600 live packets pad the PIN to 24 bytes. Time at offset 8 is often zero.
+  // Accept only a decoded year in [2020, this year + 1]. Do not invent a timestamp.
   size_t time_off = 0;
   bool time_ok = false;
   size_t candidates[] = {i, 24, 8};
@@ -1230,7 +1243,7 @@ bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& 
     uint32_t enc = ReadU32(data.data() + cand);
     int y = 0, m = 0, d = 0, h = 0, mi = 0, s = 0;
     if (!DecodeZkTime(enc, y, m, d, h, mi, s)) continue;
-    if (y < 2020 || y > 2038) continue;
+    if (!SanePunchYear(y)) continue;
     ev.year = y;
     ev.month = m;
     ev.day = d;
@@ -1241,10 +1254,7 @@ bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& 
     time_ok = true;
     break;
   }
-  if (!time_ok) {
-    fill_local_now();
-    time_off = (i + 4 <= data.size()) ? i : 0;
-  }
+  if (!time_ok) return false;
   ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second, tz_offset_min_);
 
   size_t status_off = time_off + 4;
