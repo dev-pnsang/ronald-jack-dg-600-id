@@ -14,7 +14,8 @@ RestartSec=5
 # Exit 2 = not enrolled yet — do not thrash restart
 RestartPreventExitStatus=2
 KillMode=mixed
-TimeoutStopSec=15
+# ATTLOG can take longer than a few seconds. Leave room to finish the read and send CMD_EXIT.
+TimeoutStopSec=180
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

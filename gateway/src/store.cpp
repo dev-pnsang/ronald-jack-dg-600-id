@@ -20,6 +20,7 @@ std::string ColText(sqlite3_stmt* st, int col) {
 Store::~Store() { Close(); }
 
 bool Store::Open(const std::string& db_path, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   Close();
   db_path_ = db_path;
   sqlite3* db = nullptr;
@@ -89,6 +90,7 @@ CREATE TABLE IF NOT EXISTS ops_outbox (
 }
 
 void Store::Close() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (db_) {
     sqlite3_close(static_cast<sqlite3*>(db_));
     db_ = nullptr;
@@ -96,6 +98,7 @@ void Store::Close() {
 }
 
 bool Store::SaveCredential(const Credential& c, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "INSERT INTO credential(id, device_id, organization_id, auth_secret, signing_secret, "
@@ -123,6 +126,7 @@ bool Store::SaveCredential(const Credential& c, std::string& err) {
 }
 
 bool Store::LoadCredential(Credential& out, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "SELECT device_id, organization_id, auth_secret, signing_secret, credential_id, scopes_json "
@@ -149,12 +153,14 @@ bool Store::LoadCredential(Credential& out, std::string& err) {
 }
 
 bool Store::HasCredential() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   Credential c;
   std::string err;
   return LoadCredential(c, err);
 }
 
 bool Store::SeenDedupe(const std::string& dedupe_key) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "SELECT 1 FROM seen WHERE dedupe_key=? OR EXISTS(SELECT 1 FROM outbox WHERE dedupe_key=?)";
@@ -167,6 +173,7 @@ bool Store::SeenDedupe(const std::string& dedupe_key) {
 }
 
 bool Store::Enqueue(const std::string& dedupe_key, const std::string& body_json, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (SeenDedupe(dedupe_key)) return true;
   sqlite3_stmt* st = nullptr;
   const char* sql =
@@ -188,6 +195,7 @@ bool Store::Enqueue(const std::string& dedupe_key, const std::string& body_json,
 }
 
 std::vector<OutboxItem> Store::DueOutbox(int limit, int64_t now, int max_attempts) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   std::vector<OutboxItem> items;
   sqlite3_stmt* st = nullptr;
   const char* sql =
@@ -195,7 +203,7 @@ std::vector<OutboxItem> Store::DueOutbox(int limit, int64_t now, int max_attempt
       "FROM outbox WHERE next_attempt_at<=? AND attempts<? ORDER BY id ASC LIMIT ?";
   if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &st, nullptr) != SQLITE_OK) return items;
   sqlite3_bind_int64(st, 1, now);
-  sqlite3_bind_int(st, 2, max_attempts > 0 ? max_attempts : 1000000);
+  sqlite3_bind_int(st, 2, max_attempts > 0 ? max_attempts : 1000000000);
   sqlite3_bind_int(st, 3, limit);
   while (sqlite3_step(st) == SQLITE_ROW) {
     OutboxItem it;
@@ -213,6 +221,7 @@ std::vector<OutboxItem> Store::DueOutbox(int limit, int64_t now, int max_attempt
 }
 
 bool Store::MarkOutboxOk(int64_t id, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3* db = static_cast<sqlite3*>(db_);
   if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(db);
@@ -254,6 +263,7 @@ bool Store::MarkOutboxOk(int64_t id, std::string& err) {
 
 bool Store::MarkOutboxFail(int64_t id, const std::string& error, int64_t next_attempt_at,
                            std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "UPDATE outbox SET attempts=attempts+1, last_error=?, next_attempt_at=? WHERE id=?";
@@ -271,54 +281,27 @@ bool Store::MarkOutboxFail(int64_t id, const std::string& error, int64_t next_at
 }
 
 bool Store::AbandonOutbox(int64_t id, const std::string& error, std::string& err) {
-  // The device ATTLOG is still the source. Delete the row and leave `seen` alone
-  // so the next scheduled sync can enqueue this punch again.
-  (void)error;
-  sqlite3_stmt* st = nullptr;
-  if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), "DELETE FROM outbox WHERE id=?", -1, &st,
-                         nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
-    return false;
-  }
-  sqlite3_bind_int64(st, 1, id);
-  bool ok = sqlite3_step(st) == SQLITE_DONE;
-  if (!ok) err = sqlite3_errmsg(static_cast<sqlite3*>(db_));
-  sqlite3_finalize(st);
-  return ok;
+  // A failed punch stays in the outbox. The next try waits 15 minutes.
+  return MarkOutboxFail(id, error, UnixNow() + 900, err);
 }
 
 int Store::Prune(int64_t older_than_unix, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3* db = static_cast<sqlite3*>(db_);
   int total = 0;
   sqlite3_stmt* st = nullptr;
+  // seen is a local fast path. Unsent punches stay in outbox until the server accepts them.
   if (sqlite3_prepare_v2(db, "DELETE FROM seen WHERE created_at<?", -1, &st, nullptr) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, older_than_unix);
     if (sqlite3_step(st) == SQLITE_DONE) total += sqlite3_changes(db);
     else err = sqlite3_errmsg(db);
     sqlite3_finalize(st);
   }
-  // Drop abandoned outbox (far-future next_attempt or very old)
-  st = nullptr;
-  if (sqlite3_prepare_v2(db, "DELETE FROM outbox WHERE created_at<?", -1, &st, nullptr) ==
-      SQLITE_OK) {
-    // Only prune rows that already exhausted retries (next far away) — keep active retries.
-    // Safer: delete outbox older than retention AND attempts high — handled by caller abandoning.
-    sqlite3_finalize(st);
-  }
-  // Prune exhausted: next_attempt_at more than 30 days out and created_at old
-  st = nullptr;
-  if (sqlite3_prepare_v2(
-          db, "DELETE FROM outbox WHERE created_at<? AND next_attempt_at>?", -1, &st, nullptr) ==
-      SQLITE_OK) {
-    sqlite3_bind_int64(st, 1, older_than_unix);
-    sqlite3_bind_int64(st, 2, UnixNow() + 30LL * 24 * 3600);
-    if (sqlite3_step(st) == SQLITE_DONE) total += sqlite3_changes(db);
-    sqlite3_finalize(st);
-  }
   return total;
 }
 
 bool Store::SetMeta(const std::string& key, const std::string& value, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
@@ -335,6 +318,7 @@ bool Store::SetMeta(const std::string& key, const std::string& value, std::strin
 }
 
 bool Store::GetMeta(const std::string& key, std::string& value, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), "SELECT value FROM meta WHERE key=?", -1, &st,
                          nullptr) != SQLITE_OK) {
@@ -357,6 +341,7 @@ bool Store::GetMeta(const std::string& key, std::string& value, std::string& err
 bool Store::EnqueueOpsLog(const std::string& level, const std::string& component,
                           const std::string& code, const std::string& message,
                           const std::string& fields_json, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   sqlite3_stmt* st = nullptr;
   const char* sql =
       "INSERT INTO ops_outbox(ts_iso, level, component, code, message, fields_json) "
@@ -386,6 +371,7 @@ bool Store::EnqueueOpsLog(const std::string& level, const std::string& component
 }
 
 std::vector<OpsLogItem> Store::DueOpsLogs(int limit) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   std::vector<OpsLogItem> out;
   sqlite3_stmt* st = nullptr;
   const char* sql =
@@ -413,6 +399,7 @@ std::vector<OpsLogItem> Store::DueOpsLogs(int limit) {
 }
 
 bool Store::DeleteOpsLogs(const std::vector<int64_t>& ids, std::string& err) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (ids.empty()) return true;
   for (int64_t id : ids) {
     sqlite3_stmt* st = nullptr;

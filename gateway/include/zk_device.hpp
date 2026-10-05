@@ -132,6 +132,8 @@ class ZkDevice {
   bool PollLive(AttendanceCallback cb, int wait_ms, std::string& err);
 
   const std::string& Ip() const { return ip_; }
+  // Set when a state read failed on a session that was not allowed to Enable.
+  const std::string& ConnectWarning() const { return connect_warning_; }
   int Port() const { return port_; }
   const DeviceInfo& LastInfo() const { return info_; }
   static const char* ProtocolName() { return "ZKTeco TCP wire protocol (pyzk-compatible)"; }
@@ -162,6 +164,7 @@ class ZkDevice {
   bool connected_ = false;
   bool live_ = false;
   bool enable_attempted_ = false;
+  std::string connect_warning_;
   uint16_t session_id_ = 0;
   uint16_t reply_id_ = 0;
   std::string ip_;

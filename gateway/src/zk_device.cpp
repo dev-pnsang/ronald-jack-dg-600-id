@@ -517,8 +517,15 @@ bool ZkDevice::EnsureAttendanceSensor(std::string& err, bool allow_enable) {
   bool enabled = false;
   int state = -1;
   enable_attempted_ = false;
+  connect_warning_.clear();
   if (!ReadAttendanceSensor(enabled, state, err)) {
     LogWarning("Attendance sensor status unreadable: " + err);
+    if (!allow_enable) {
+      connect_warning_ = "STATE_RRQ failed; attendance read continues: " + err;
+      LogWarning(connect_warning_);
+      err.clear();
+      return true;
+    }
     return false;
   }
   if (!allow_enable) {
@@ -641,6 +648,7 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
                        std::string& err, bool allow_sensor_enable, bool* enable_attempted) {
   Disconnect();
   enable_attempted_ = false;
+  connect_warning_.clear();
   if (enable_attempted) *enable_attempted = false;
   ip_ = ip;
   port_ = port;

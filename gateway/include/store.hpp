@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -42,14 +43,14 @@ class Store {
 
   bool Enqueue(const std::string& dedupe_key, const std::string& body_json, std::string& err);
   bool SeenDedupe(const std::string& dedupe_key);
-  // Only rows with attempts < max_attempts and next_attempt_at <= now.
+  // Rows with next_attempt_at <= now. max_attempts <= 0 means no attempt cap.
   std::vector<OutboxItem> DueOutbox(int limit, int64_t now, int max_attempts);
   bool MarkOutboxOk(int64_t id, std::string& err);
   bool MarkOutboxFail(int64_t id, const std::string& error, int64_t next_attempt_at, std::string& err);
-  // Drop an exhausted outbox row. Does not mark seen, so the next ATTLOG sync can enqueue it again.
+  // Keep the punch. Schedule a slow retry. Never deletes the row.
   bool AbandonOutbox(int64_t id, const std::string& error, std::string& err);
 
-  // Delete seen rows and abandoned outbox older than cutoff (unix seconds).
+  // Delete seen rows older than cutoff. Unsent outbox rows are never deleted.
   int Prune(int64_t older_than_unix, std::string& err);
 
   bool SetMeta(const std::string& key, const std::string& value, std::string& err);
@@ -64,6 +65,7 @@ class Store {
  private:
   void* db_ = nullptr;  // sqlite3*
   std::string db_path_;
+  std::recursive_mutex mu_;
 };
 
 }  // namespace cg
