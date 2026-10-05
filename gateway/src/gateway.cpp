@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "capture.hpp"
 #include "device_identity.hpp"
 #include "http_client.hpp"
 #include "ingest.hpp"
@@ -141,6 +142,7 @@ void OpsLog(Store& store, const char* level, const char* component, const char* 
             const std::string& message, const nlohmann::json& fields = nlohmann::json::object()) {
   std::string oe;
   store.EnqueueOpsLog(level, component, code, message, fields.dump(), oe);
+  AppendOpsCapture(level ? level : "", component ? component : "", code ? code : "", message, fields.dump());
 }
 
 bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
@@ -593,6 +595,7 @@ int RunSyncUsers(const Config& cfg_in) {
     std::fprintf(stderr, "%s\n", err.c_str());
     return 1;
   }
+  SetCaptureDir(cfg.data_dir);
   Store store;
   if (!store.Open(cfg.data_dir + "/state.db", err)) {
     std::fprintf(stderr, "store: %s\n", err.c_str());
@@ -650,6 +653,7 @@ int RunSyncUsers(const Config& cfg_in) {
            "Không kết nối được máy chấm công khi đồng bộ user id thủ công",
            {{"ip", tip}, {"port", tport}, {"detail", err}, {"phase", "sync_users_cli"}});
     FlushOpsLogs(cfg, store, http, cred);
+    FlushCaptureArchives(cfg, http, cred, true);
     return 3;
   }
   std::vector<UserRecord> users;
@@ -660,6 +664,7 @@ int RunSyncUsers(const Config& cfg_in) {
            {{"ip", tip}, {"detail", err}});
     device.Disconnect();
     FlushOpsLogs(cfg, store, http, cred);
+    FlushCaptureArchives(cfg, http, cred, true);
     return 4;
   }
   device.Disconnect();
@@ -672,9 +677,11 @@ int RunSyncUsers(const Config& cfg_in) {
 
   if (!SyncMachineUsersCatalog(cfg, store, http, cred, tid, tip, users, /*force=*/true)) {
     FlushOpsLogs(cfg, store, http, cred);
+    FlushCaptureArchives(cfg, http, cred, true);
     return 5;
   }
   FlushOpsLogs(cfg, store, http, cred);
+  FlushCaptureArchives(cfg, http, cred, true);
   std::fprintf(stdout, "OK synced %zu users from %s to %s/checkin/machine-users\n", users.size(),
                tip.c_str(), cfg.base_url.c_str());
   return 0;
@@ -690,6 +697,7 @@ int RunGateway(const Config& cfg_in) {
     std::fprintf(stderr, "%s\n", err.c_str());
     return 1;
   }
+  SetCaptureDir(cfg.data_dir);
   HardenDataDir(cfg);
   Store store;
   if (!store.Open(cfg.data_dir + "/state.db", err)) {
@@ -1341,6 +1349,7 @@ int RunGateway(const Config& cfg_in) {
 
     FlushOutbox(cfg, store, http, cred);
     FlushOpsLogs(cfg, store, http, cred);
+    FlushCaptureArchives(cfg, http, cred);
     now = UnixNow();
     if (now - last_prune > 3600) {
       last_prune = now;
@@ -1386,6 +1395,7 @@ int RunGateway(const Config& cfg_in) {
   live_device.Disconnect();
   OpsLog(store, "info", "gateway", "gateway_stop", "Dịch vụ checkin-gateway đang dừng", {});
   FlushOpsLogs(cfg, store, http, cred);
+  FlushCaptureArchives(cfg, http, cred, true);
   std::fprintf(stderr, "[gateway] stopped\n");
   return 0;
 }

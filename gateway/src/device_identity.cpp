@@ -50,7 +50,7 @@ bool EnrollDevice(const Config& cfg, const HttpClient& http, const std::string& 
 
 SignedResult SignedRequest(const Config& cfg, const HttpClient& http, const Credential& cred,
                            const std::string& method, const std::string& path,
-                           const std::string& raw_body) {
+                           const std::string& raw_body, const std::string& content_type) {
   SignedResult r;
   if (cred.auth_secret.empty() || cred.signing_secret.empty()) {
     r.error = "missing credentials";
@@ -60,10 +60,11 @@ SignedResult SignedRequest(const Config& cfg, const HttpClient& http, const Cred
   std::string nonce = NewUuidV4();
   std::string msg = ts + "." + nonce + "." + raw_body;
   std::string sig = HmacSha256Hex(cred.signing_secret, msg);
+  std::string ctype = content_type.empty() ? "application/json" : content_type;
 
   std::map<std::string, std::string> headers = {
       {"Authorization", "Bearer " + cred.auth_secret},
-      {"Content-Type", "application/json"},
+      {"Content-Type", ctype},
       {"X-CommaDesk-Timestamp", ts},
       {"X-CommaDesk-Nonce", nonce},
       {"X-CommaDesk-Signature", "sha256=" + sig},

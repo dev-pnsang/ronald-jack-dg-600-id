@@ -30,7 +30,8 @@ bool EnrollDevice(const Config& cfg, const HttpClient& http, const std::string& 
 // HMAC-signed request: Authorization Bearer + timestamp + nonce + signature.
 SignedResult SignedRequest(const Config& cfg, const HttpClient& http, const Credential& cred,
                            const std::string& method, const std::string& path,
-                           const std::string& raw_body);
+                           const std::string& raw_body,
+                           const std::string& content_type = "application/json");
 
 // ACK after admin rotate — call with NEW credential.
 SignedResult AckCredential(const Config& cfg, const HttpClient& http, const Credential& new_cred);

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 
+#include "capture.hpp"
 #include "log.hpp"
 #include "util.hpp"
 
@@ -922,21 +923,31 @@ bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vec
     return true;
   };
 
+  auto keep_raw = [&](bool ok) {
+    if (ok && !raw.bytes.empty()) {
+      const char* label = "bulk";
+      if (command == CMD_ATTLOG_RRQ) label = "CMD_ATTLOG_RRQ";
+      else if (command == CMD_USERTEMP_RRQ) label = "CMD_USERTEMP_RRQ";
+      AppendRawCapture(label, raw.bytes);
+    }
+    return ok;
+  };
+
   // DG-600 READ_BUFFER often returns ~1KiB chunks. For large ATTLOG that means hundreds of
   // RTTs (panel lag). Prefer continuous PREPARE_DATA stream for attendance.
   if (command == CMD_ATTLOG_RRQ) {
-    if (FetchLargeData(command, legacy_req, raw, err)) return true;
+    if (keep_raw(FetchLargeData(command, legacy_req, raw, err))) return true;
     LogWarning("stream attlog failed, try buffered: " + err);
     std::string e_re;
     if (!reconnect(e_re)) {
       err = e_re;
       return false;
     }
-    return FetchLargeDataBuffered(command, fct, 0, raw, err);
+    return keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, err));
   }
 
   std::string buf_err;
-  if (FetchLargeDataBuffered(command, fct, 0, raw, buf_err)) {
+  if (keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, buf_err))) {
     return true;
   }
   LogWarning("buffered read failed, fallback stream: " + buf_err);
@@ -945,7 +956,7 @@ bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vec
     err = e_re;
     return false;
   }
-  return FetchLargeData(command, legacy_req, raw, err);
+  return keep_raw(FetchLargeData(command, legacy_req, raw, err));
 }
 
 

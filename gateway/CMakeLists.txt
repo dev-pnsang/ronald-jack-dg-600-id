@@ -21,6 +21,7 @@ add_executable(checkin-gateway
   src/store.cpp
   src/gateway.cpp
   src/probe.cpp
+  src/capture.cpp
 )
 
 target_include_directories(checkin-gateway PRIVATE
