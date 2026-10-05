@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -321,6 +322,15 @@ bool ZkDevice::CreateSocket(std::string& err) {
   tv.tv_sec = timeout_sec_;
   setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  // A pulled cable otherwise stays "connected" until the next send. Probes turn that into a read error.
+  int keepalive = 1;
+  setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+  int idle = 30;
+  int intvl = 10;
+  int cnt = 3;
+  setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+  setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
   return true;
 }
 
@@ -506,6 +516,7 @@ bool ZkDevice::ReadAttendanceSensor(bool& enabled, int& state, std::string& err)
 bool ZkDevice::EnsureAttendanceSensor(std::string& err, bool allow_enable) {
   bool enabled = false;
   int state = -1;
+  enable_attempted_ = false;
   if (!ReadAttendanceSensor(enabled, state, err)) {
     LogWarning("Attendance sensor status unreadable: " + err);
     return false;
@@ -533,6 +544,7 @@ bool ZkDevice::EnsureAttendanceSensor(std::string& err, bool allow_enable) {
   }
   // State 0 = waiting, not identifying. One short Enable, no retry.
   LogInfo("Attendance sensor is not identifying — enabling once");
+  enable_attempted_ = true;
   if (!EnableDevice(true, err, 1500)) {
     LogWarning("Enable attendance sensor failed (not retried): " + err);
     return false;
@@ -626,8 +638,10 @@ DeviceOptionResult ZkDevice::ProbeOption(const std::string& key) {
 }
 
 bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeout_sec,
-                       std::string& err, bool allow_sensor_enable) {
+                       std::string& err, bool allow_sensor_enable, bool* enable_attempted) {
   Disconnect();
+  enable_attempted_ = false;
+  if (enable_attempted) *enable_attempted = false;
   ip_ = ip;
   port_ = port;
   password_ = password;
@@ -650,10 +664,12 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
   std::string e2;
   if (!EnsureAttendanceSensor(e2, allow_sensor_enable)) {
     LogError("Attendance sensor check failed: " + e2);
+    if (enable_attempted) *enable_attempted = enable_attempted_;
     ReleaseSession();
     err = e2;
     return false;
   }
+  if (enable_attempted) *enable_attempted = enable_attempted_;
   connected_ = true;
   info_.ip = ip_;
   info_.port = port_;

@@ -5,6 +5,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <sstream>
 #include <ctime>
 #include <fstream>
@@ -211,6 +213,53 @@ bool SyncMachineUsersCatalog(Config& cfg, Store& store, const HttpClient& http, 
 }
 
 
+// Local calendar day. day_offset -1 is yesterday. mktime normalizes month edges.
+std::string LocalYmd(int day_offset) {
+  std::time_t now = std::time(nullptr);
+  std::tm tmb{};
+  localtime_r(&now, &tmb);
+  tmb.tm_mday += day_offset;
+  tmb.tm_isdst = -1;
+  std::mktime(&tmb);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmb.tm_year + 1900, tmb.tm_mon + 1, tmb.tm_mday);
+  return buf;
+}
+
+// 1 minute, then 5 minutes, then 15 minutes.
+int64_t BackoffDelaySec(int step) {
+  if (step <= 0) return 60;
+  if (step == 1) return 300;
+  return 900;
+}
+
+// Latest configured HH:MM that has already started today. Empty before the first slot.
+// The key stays due until a read succeeds, including after the old 90-second window.
+std::string LatestPassedSyncSlot(const std::string& times_csv) {
+  std::time_t now = std::time(nullptr);
+  std::tm tmb{};
+  localtime_r(&now, &tmb);
+  std::string csv = times_csv.empty() ? "00:00,12:00" : times_csv;
+  std::stringstream ss(csv);
+  std::string part;
+  std::string best;
+  int best_mins = -1;
+  const int now_mins = tmb.tm_hour * 60 + tmb.tm_min;
+  while (std::getline(ss, part, ',')) {
+    int h = -1, m = -1;
+    if (std::sscanf(part.c_str(), "%d:%d", &h, &m) != 2) continue;
+    if (h < 0 || h > 23 || m < 0 || m > 59) continue;
+    const int target = h * 60 + m;
+    if (now_mins < target || target < best_mins) continue;
+    best_mins = target;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d-%02d%02d", tmb.tm_year + 1900, tmb.tm_mon + 1,
+                  tmb.tm_mday, h, m);
+    best = buf;
+  }
+  return best;
+}
+
 // Fire in the first ~90s of each configured HH:MM slot (once per slot key).
 std::string CurrentAttlogSyncSlot(const std::string& times_csv) {
   std::time_t now = std::time(nullptr);
@@ -297,6 +346,23 @@ void ApplyDeviceBootstrap(Config& cfg, Store& store, HttpClient& http, Credentia
   }
 }
 
+bool SensorEnableAllowed(Store& store, const std::map<std::string, bool>& spent, const std::string& ip) {
+  auto it = spent.find(ip);
+  if (it != spent.end() && it->second) return false;
+  std::string raw;
+  std::string err;
+  if (!store.GetMeta("sensor_enable_at:" + ip, raw, err) || raw.empty()) return true;
+  const int64_t at = std::strtoll(raw.c_str(), nullptr, 10);
+  if (at <= 0) return true;
+  return UnixNow() - at >= 900;
+}
+
+void NoteSensorEnable(Store& store, std::map<std::string, bool>& spent, const std::string& ip) {
+  spent[ip] = true;
+  std::string err;
+  store.SetMeta("sensor_enable_at:" + ip, std::to_string(UnixNow()), err);
+}
+
 bool PunchOnOrAfter(const AttendanceEvent& ev, const std::string& ymd) {
   if (ymd.empty() || ymd.size() < 10) return true;
   int y = 0, m = 0, d = 0;
@@ -368,8 +434,10 @@ bool EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const
   return true;
 }
 
-void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Credential& cred) {
-  auto due = store.DueOutbox(20, UnixNow(), cfg.outbox_max_attempts);
+void FlushOutbox(Config& cfg, Store& store, const HttpClient& http, const Credential& cred,
+                  int limit = 20) {
+  if (limit < 1) limit = 1;
+  auto due = store.DueOutbox(limit, UnixNow(), cfg.outbox_max_attempts);
   for (const auto& item : due) {
     if (!g_running) break;
     auto r = PostDeviceIngest(cfg, http, cred, item.body_json);
@@ -893,13 +961,21 @@ int RunGateway(const Config& cfg_in) {
           {"live_listen", cfg.live_listen}});
   FlushOpsLogs(cfg, store, http, cred);
 
+  // One Enable per terminal per 15 minutes, and only on a session that is allowed to try.
+  // Reconnects pass allow_enable false.
+  std::map<std::string, bool> sensor_enable_spent;
+
   // Sync device wall-clock from gateway local time on every service start (DG-600 often
   // boots at 2000-01-01 after power loss).
   auto sync_terminal_clock = [&](const TerminalTarget& t) {
     std::string local_err;
     ZkDevice device;
     device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+    bool enable_attempted = false;
+    const bool allow_enable = SensorEnableAllowed(store, sensor_enable_spent, t.ip);
+    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err,
+                        allow_enable, &enable_attempted)) {
+      if (enable_attempted) NoteSensorEnable(store, sensor_enable_spent, t.ip);
       std::fprintf(stderr, "[time] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
       OpsLog(store, "warn", "zk", "connect_fail",
              "Không kết nối được máy chấm công khi đồng bộ giờ",
@@ -923,9 +999,11 @@ int RunGateway(const Config& cfg_in) {
              "Kết nối được máy nhưng đồng bộ giờ thất bại",
              {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
               {"before", before_s}});
+      if (allow_enable) NoteSensorEnable(store, sensor_enable_spent, t.ip);
       device.Disconnect();
       return;
     }
+    if (allow_enable) NoteSensorEnable(store, sensor_enable_spent, t.ip);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     DeviceTime after;
     std::string after_s = "?";
@@ -957,16 +1035,30 @@ int RunGateway(const Config& cfg_in) {
   int64_t last_prune = 0;
   int64_t last_heartbeat = UnixNow();
   int64_t last_bootstrap = UnixNow();
-  // A live failure stays down until the next ATTLOG or user slot. No 15-minute reconnect.
-  bool live_stopped = false;
+  // Live reconnects on its own timer: 1m, then 5m, then 15m. ATTLOG does not start a second loop.
+  int live_backoff_step = 0;
+  int64_t next_live_attempt = 0;
+  bool live_catchup_armed = false;
   std::string last_sync_slot;
   std::string last_users_sync_slot;
+  int attlog_backoff_step = 0;
+  int64_t next_attlog_attempt = 0;
+  std::vector<std::string> attlog_owed;
   {
     std::string meta_err;
+    std::string raw_next;
+    std::string raw_step;
     store.GetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
     store.GetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
+    store.GetMeta("attlog_next_attempt", raw_next, meta_err);
+    store.GetMeta("attlog_backoff_step", raw_step, meta_err);
+    if (!raw_next.empty()) next_attlog_attempt = std::strtoll(raw_next.c_str(), nullptr, 10);
+    if (!raw_step.empty()) attlog_backoff_step = std::atoi(raw_step.c_str());
   }
-  // Never sync ATTLOG/users on startup — only at configured local HH:MM slots.
+  const std::string today_ymd = LocalYmd(0);
+  // One catch-up when this process starts and today has not been read yet.
+  bool attlog_catchup_pending =
+      !terminals.empty() && (last_sync_slot.size() < 10 || last_sync_slot.compare(0, 10, today_ymd) != 0);
 
   // Persistent RegEvent session on the primary terminal (realtime punches).
   // Do NOT ReadUsers/ATTLOG on this socket — bulk breaks RegEvent on DG-600 until reconnect.
@@ -1008,12 +1100,15 @@ int RunGateway(const Config& cfg_in) {
       }
       live_ops_ok = false;
     };
+    bool enable_attempted = false;
     if (!live_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, err,
-                             allow_sensor_enable)) {
+                             allow_sensor_enable, &enable_attempted)) {
+      if (allow_sensor_enable && enable_attempted) NoteSensorEnable(store, sensor_enable_spent, t.ip);
       std::fprintf(stderr, "[zk] live connect failed: %s\n", err.c_str());
       log_live_fail("connect_fail", "Không kết nối được máy chấm công (lắng nghe realtime)");
       return false;
     }
+    if (allow_sensor_enable) NoteSensorEnable(store, sensor_enable_spent, t.ip);
     live_device.ReadDeviceInfo(live_info, err);
     if (!live_device.StartLiveCapture(err)) {
       std::fprintf(stderr, "[zk] StartLiveCapture failed: %s\n", err.c_str());
@@ -1050,7 +1145,8 @@ int RunGateway(const Config& cfg_in) {
     {
       ZkDevice device;
       device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err,
+                          /*allow_sensor_enable=*/false)) {
         std::fprintf(stderr, "[users] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
         OpsLog(store, "warn", "zk", "connect_fail",
                "Không kết nối được máy chấm công khi đồng bộ user id",
@@ -1114,7 +1210,7 @@ int RunGateway(const Config& cfg_in) {
     }
   };
 
-  auto sync_terminal_attlog = [&](const TerminalTarget& t, bool also_users) {
+  auto sync_terminal_attlog = [&](const TerminalTarget& t, bool also_users) -> bool {
     DeviceInfo info;
     info.ip = t.ip;
     info.port = t.port;
@@ -1122,7 +1218,7 @@ int RunGateway(const Config& cfg_in) {
     const std::string tid = t.id.empty() ? t.ip : t.id;
     std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s users=%d\n", t.name.c_str(),
                  t.id.c_str(), t.ip.c_str(), t.port,
-                 t.usage_started_on.empty() ? "(today)" : t.usage_started_on.c_str(),
+                 t.usage_started_on.empty() ? "(yesterday+today)" : t.usage_started_on.c_str(),
                  also_users ? 1 : 0);
     OpsLog(store, "info", "attlog", "attlog_start",
            "Bắt đầu đồng bộ nhật ký chấm công (ATTLOG) từ máy",
@@ -1143,7 +1239,8 @@ int RunGateway(const Config& cfg_in) {
     {
       ZkDevice device;
       device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err)) {
+      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err,
+                          /*allow_sensor_enable=*/false)) {
         std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
         OpsLog(store, "warn", "zk", "connect_fail",
                "Không kết nối được máy chấm công khi đồng bộ ATTLOG",
@@ -1220,19 +1317,12 @@ int RunGateway(const Config& cfg_in) {
              "Đọc ATTLOG rỗng trong khi máy vẫn còn nhật ký — không ghi đè fingerprint",
              {{"ip", t.ip}, {"port", t.port}, {"log_count", info.log_count}});
     }
-    if (!attlog_read_ok) return;
+    if (!attlog_read_ok) return false;
 
-    // No start date: only today. The terminal cannot rewrite old punches, so a full history
-    // upload would dump years of rows the server cannot correct on the device.
-    std::string since = t.usage_started_on;
-    if (since.empty()) {
-      std::time_t tn = std::time(nullptr);
-      std::tm tmb{};
-      localtime_r(&tn, &tmb);
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmb.tm_year + 1900, tmb.tm_mon + 1, tmb.tm_mday);
-      since = buf;
-    }
+    // Yesterday and today only. A start date in the future still raises the floor.
+    // An older usage_started_on must not replay the whole device log after `seen` is pruned.
+    std::string since = LocalYmd(-1);
+    if (!t.usage_started_on.empty() && t.usage_started_on > since) since = t.usage_started_on;
 
     std::vector<AttendanceEvent> filtered;
     filtered.reserve(logs.size());
@@ -1261,7 +1351,7 @@ int RunGateway(const Config& cfg_in) {
                "Nhật ký chấm công không đổi — bỏ qua gửi lên server",
                {{"ip", t.ip}, {"port", t.port}, {"raw", logs.size()}, {"filtered", filtered.size()},
                 {"fp", fp}});
-        return;
+        return true;
       }
       std::fprintf(stderr, "[attlog] %s fp unchanged but some punches are not ingested yet\n",
                    t.ip.c_str());
@@ -1294,11 +1384,12 @@ int RunGateway(const Config& cfg_in) {
             {"fp", fp}});
 
     // Local outbox only. The device ATTLOG is left intact.
-    FlushOutbox(cfg, store, http, cred);
+    FlushOutbox(cfg, store, http, cred, 5);
     std::fprintf(stderr, "[attlog] %s kept device ATTLOG after enqueue=%d\n", t.ip.c_str(), enq);
     OpsLog(store, "info", "attlog", "attlog_kept",
            "Giữ nguyên nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
            {{"ip", t.ip}, {"enqueued", enq}});
+    return !enqueue_failed;
   };
 
   while (g_running) {
@@ -1338,41 +1429,102 @@ int RunGateway(const Config& cfg_in) {
       }
     }
 
-    std::string slot = CurrentAttlogSyncSlot(cfg.attlog_sync_times);
+    std::string slot = LatestPassedSyncSlot(cfg.attlog_sync_times);
     std::string users_slot = CurrentAttlogSyncSlot(cfg.users_sync_times);
-    const bool attlog_due = !slot.empty() && slot != last_sync_slot && !terminals.empty();
+    const bool slot_due = !slot.empty() && slot != last_sync_slot && !terminals.empty();
+    const bool attlog_due =
+        (slot_due || attlog_catchup_pending) && !terminals.empty() && now >= next_attlog_attempt;
     const bool users_due =
-        !users_slot.empty() && users_slot != last_users_sync_slot && !terminals.empty();
+        !users_slot.empty() && users_slot != last_users_sync_slot && !terminals.empty() && !attlog_due;
     // Same HH:MM window: one TCP session does ATTLOG + users (avoids double disconnect on DG-600).
-    const bool users_with_attlog = attlog_due && users_due && slot == users_slot;
+    const bool users_with_attlog = attlog_due && !users_slot.empty() && users_slot == slot &&
+                                   users_slot != last_users_sync_slot;
 
-    // Live reopen after a bulk pull must not send Enable (that freezes the panel).
-    bool skip_sensor_enable = false;
-    if (attlog_due) {
-      skip_sensor_enable = true;
-      live_stopped = false;
+    auto arm_live_backoff = [&](const char* detail) {
       live_device.Disconnect();
-      std::fprintf(stderr, "[attlog] scheduled sync slot=%s terminals=%zu users=%d\n", slot.c_str(),
-                   terminals.size(), users_with_attlog ? 1 : 0);
+      const int64_t wait = BackoffDelaySec(live_backoff_step);
+      if (live_backoff_step < 2) ++live_backoff_step;
+      next_live_attempt = UnixNow() + wait;
+      live_ops_ok = false;
+      std::fprintf(stderr, "[zk] live down — reconnect in %llds (%s)\n", static_cast<long long>(wait),
+                   detail);
+      OpsLog(store, "warn", "zk", "live_backoff",
+             "Mất kết nối realtime. Sẽ nối lại sau thời gian chờ",
+             {{"ip", live_ip},
+              {"port", live_port},
+              {"wait_sec", wait},
+              {"detail", detail}});
+      if (!live_catchup_armed) {
+        live_catchup_armed = true;
+        attlog_catchup_pending = true;
+        if (next_attlog_attempt > UnixNow()) {
+          // An ATTLOG failure is already waiting. Do not open a second device session.
+        } else {
+          next_attlog_attempt = UnixNow();
+        }
+      }
+    };
+
+    if (attlog_due) {
+      const bool live_was_up = live_device.IsConnected();
+      live_device.Disconnect();
+      std::fprintf(stderr, "[attlog] sync slot=%s catchup=%d terminals=%zu users=%d owed=%zu\n",
+                   slot.c_str(), attlog_catchup_pending ? 1 : 0, terminals.size(),
+                   users_with_attlog ? 1 : 0, attlog_owed.size());
       OpsLog(store, "info", "attlog", "attlog_slot",
-             "Tới khung giờ đồng bộ ATTLOG",
-             {{"slot", slot}, {"terminals", terminals.size()}, {"with_users", users_with_attlog}});
+             "Đọc ATTLOG hôm qua và hôm nay",
+             {{"slot", slot},
+              {"terminals", terminals.size()},
+              {"catchup", attlog_catchup_pending},
+              {"with_users", users_with_attlog}});
+      std::vector<std::string> failed;
+      int attempted = 0;
       for (const auto& t : terminals) {
         if (!g_running) break;
-        sync_terminal_attlog(t, /*also_users=*/users_with_attlog);
-        FlushOutbox(cfg, store, http, cred);
+        const std::string tid = t.id.empty() ? t.ip : t.id;
+        if (!attlog_owed.empty() &&
+            std::find(attlog_owed.begin(), attlog_owed.end(), tid) == attlog_owed.end()) {
+          continue;
+        }
+        ++attempted;
+        if (!sync_terminal_attlog(t, /*also_users=*/users_with_attlog)) failed.push_back(tid);
       }
-      last_sync_slot = slot;
       std::string meta_err;
-      store.SetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
-      if (users_with_attlog) {
-        last_users_sync_slot = users_slot;
-        store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
+      if (attempted == 0) {
+        attlog_owed.clear();
+      } else if (failed.empty() && g_running) {
+        attlog_owed.clear();
+        attlog_backoff_step = 0;
+        next_attlog_attempt = 0;
+        attlog_catchup_pending = false;
+        store.SetMeta("attlog_next_attempt", "0", meta_err);
+        store.SetMeta("attlog_backoff_step", "0", meta_err);
+        if (!slot.empty()) {
+          last_sync_slot = slot;
+          store.SetMeta("attlog_last_sync_slot", last_sync_slot, meta_err);
+        }
+        if (users_with_attlog) {
+          last_users_sync_slot = users_slot;
+          store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
+        }
+      } else if (!failed.empty()) {
+        attlog_owed = std::move(failed);
+        attlog_catchup_pending = true;
+        const int64_t wait = BackoffDelaySec(attlog_backoff_step);
+        if (attlog_backoff_step < 2) ++attlog_backoff_step;
+        next_attlog_attempt = UnixNow() + wait;
+        store.SetMeta("attlog_next_attempt", std::to_string(next_attlog_attempt), meta_err);
+        store.SetMeta("attlog_backoff_step", std::to_string(attlog_backoff_step), meta_err);
+        std::fprintf(stderr, "[attlog] %zu terminal(s) failed — retry in %llds, slot not marked\n",
+                     attlog_owed.size(), static_cast<long long>(wait));
+        OpsLog(store, "warn", "attlog", "attlog_retry",
+               "Đọc ATTLOG chưa xong. Khung giờ chưa được đánh dấu",
+               {{"failed", attlog_owed.size()}, {"wait_sec", wait}, {"slot", slot}});
       }
       FlushOpsLogs(cfg, store, http, cred);
+      if (live_was_up) next_live_attempt = UnixNow();
     } else if (users_due) {
-      skip_sensor_enable = true;
-      live_stopped = false;
+      const bool live_was_up = live_device.IsConnected();
       live_device.Disconnect();
       std::fprintf(stderr, "[users] scheduled sync slot=%s terminals=%zu\n", users_slot.c_str(),
                    terminals.size());
@@ -1387,52 +1539,47 @@ int RunGateway(const Config& cfg_in) {
       std::string meta_err;
       store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
       FlushOpsLogs(cfg, store, http, cred);
+      if (live_was_up) next_live_attempt = UnixNow();
     }
 
-    FlushOutbox(cfg, store, http, cred);
-    FlushOpsLogs(cfg, store, http, cred);
-    FlushCaptureArchives(cfg, http, cred);
     now = UnixNow();
     if (now - last_prune > 3600) {
       last_prune = now;
       MaybePrune(store, cfg);
     }
 
-    if (cfg.live_listen && !live_stopped) {
-      if (!ensure_live(!skip_sensor_enable)) {
-        live_stopped = true;
+    if (cfg.live_listen && !terminals.empty()) {
+      const TerminalTarget& primary = terminals[0];
+      if (live_device.IsConnected() && (live_ip != primary.ip || live_port != primary.port)) {
         live_device.Disconnect();
-        std::fprintf(stderr,
-                     "[zk] live connect failed — realtime stays off until the next ATTLOG or user sync\n");
-        OpsLog(store, "warn", "zk", "live_stopped",
-               "Không kết nối được máy. Realtime dừng đến khung giờ đồng bộ ATTLOG hoặc user kế tiếp",
-               {{"ip", live_ip}, {"port", live_port}});
-      } else {
+        live_backoff_step = 0;
+        next_live_attempt = UnixNow();
+        live_catchup_armed = false;
+      }
+      if (!live_device.IsConnected() && now >= next_live_attempt) {
+        const bool allow_enable = SensorEnableAllowed(store, sensor_enable_spent, primary.ip);
+        if (!ensure_live(allow_enable)) {
+          arm_live_backoff("connect");
+        } else {
+          live_backoff_step = 0;
+          next_live_attempt = 0;
+          live_catchup_armed = false;
+        }
+      } else if (live_device.IsConnected()) {
         std::string live_err;
-        bool ok = live_device.PollLive(
+        const bool ok = live_device.PollLive(
             [&](const AttendanceEvent& ev) { EnqueuePunch(store, cfg, live_info, ev); }, 500,
             live_err);
-        if (!ok) {
-          live_stopped = true;
-          std::fprintf(stderr, "[zk] live poll error: %s — realtime stays off until the next sync slot\n",
-                       live_err.c_str());
-          live_device.Disconnect();
-          OpsLog(store, "warn", "zk", "live_stopped",
-                 "Mất kết nối realtime. Dừng đến khung giờ đồng bộ ATTLOG hoặc user kế tiếp",
-                 {{"ip", live_ip}, {"port", live_port}, {"detail", live_err}});
-          live_ops_ok = false;
-          FlushOutbox(cfg, store, http, cred);
-        } else {
-          FlushOutbox(cfg, store, http, cred);
-        }
+        if (!ok) arm_live_backoff(live_err.c_str());
       }
     }
-    if (!cfg.live_listen || live_stopped) {
-      // Idle — ATTLOG slots only (no realtime).
-      for (int i = 0; i < 30 && g_running; ++i) {
-        FlushOutbox(cfg, store, http, cred);
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-      }
+
+    const int flush_limit = live_device.IsConnected() ? 1 : 5;
+    FlushOutbox(cfg, store, http, cred, flush_limit);
+    FlushOpsLogs(cfg, store, http, cred);
+    FlushCaptureArchives(cfg, http, cred);
+    if (!live_device.IsConnected()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
     }
   }
 

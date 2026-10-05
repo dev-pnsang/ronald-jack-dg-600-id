@@ -84,10 +84,11 @@ class ZkDevice {
   ZkDevice(const ZkDevice&) = delete;
   ZkDevice& operator=(const ZkDevice&) = delete;
 
-  // allow_sensor_enable: state 0 may send one Enable. Pass false on the live
-  // session opened right after an ATTLOG/user pull, and on the 15-minute probe.
+  // allow_sensor_enable: state 0 may send one Enable. Pass false on every reconnect
+  // and on the live session opened after an ATTLOG or user pull.
+  // enable_attempted is set when that one Enable was actually sent.
   bool Connect(const std::string& ip, int port, int password, int timeout_sec, std::string& err,
-               bool allow_sensor_enable = true);
+               bool allow_sensor_enable = true, bool* enable_attempted = nullptr);
   void Disconnect();
   void SetTzOffsetMinutes(int offset_min) { tz_offset_min_ = offset_min; }
   bool IsConnected() const { return connected_; }
@@ -160,6 +161,7 @@ class ZkDevice {
   int fd_ = -1;
   bool connected_ = false;
   bool live_ = false;
+  bool enable_attempted_ = false;
   uint16_t session_id_ = 0;
   uint16_t reply_id_ = 0;
   std::string ip_;
