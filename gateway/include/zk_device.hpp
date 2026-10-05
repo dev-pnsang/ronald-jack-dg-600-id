@@ -153,7 +153,7 @@ class ZkDevice {
   bool ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& ev);
   bool FetchLargeData(uint16_t command, const std::vector<uint8_t>& req, RawBlob& raw,
                       std::string& err);
-  // pyzk-style buffered pull (CMD_PREPARE_BUFFER / CMD_READ_BUFFER).
+  // Refuses. CMD_READ_BUFFER in ~1KB chunks stalls this DG-600. Callers use the stream.
   bool FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
                               std::string& err);
   bool FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,

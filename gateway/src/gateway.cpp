@@ -760,7 +760,8 @@ int RunSyncUsers(const Config& cfg_in) {
          {{"ip", tip}, {"port", tport}, {"name", tname}});
   ZkDevice device;
   device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-  if (!device.Connect(tip, tport, cfg.device_password, cfg.device_timeout_sec, err)) {
+  if (!device.Connect(tip, tport, cfg.device_password, cfg.device_timeout_sec, err,
+                      /*allow_sensor_enable=*/false)) {
     std::fprintf(stderr, "[users] connect fail: %s\n", err.c_str());
     OpsLog(store, "warn", "zk", "connect_fail",
            "Không kết nối được máy chấm công khi đồng bộ user id thủ công",

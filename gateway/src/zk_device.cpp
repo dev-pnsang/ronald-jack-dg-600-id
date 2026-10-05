@@ -33,8 +33,6 @@ constexpr uint16_t CMD_ACK_UNAUTH = 2005;
 constexpr uint16_t CMD_PREPARE_DATA = 1500;
 constexpr uint16_t CMD_DATA = 1501;
 constexpr uint16_t CMD_FREE_DATA = 1502;
-constexpr uint16_t CMD_PREPARE_BUFFER = 1503;  // pyzk read_with_buffer
-constexpr uint16_t CMD_READ_BUFFER = 1504;
 constexpr uint16_t CMD_USERTEMP_RRQ = 9;
 constexpr uint16_t CMD_ATTLOG_RRQ = 13;
 constexpr uint16_t CMD_CLEAR_ATTLOG = 15;
@@ -46,7 +44,6 @@ constexpr uint16_t CMD_STATE_RRQ = 64;
 constexpr uint16_t CMD_REFRESHDATA = 1013;
 constexpr uint16_t CMD_REG_EVENT = 500;
 constexpr int32_t FCT_USER = 5;
-constexpr uint32_t BUF_MAX_CHUNK = 0xFFc0;  // ~64KiB TCP chunk (pyzk)
 constexpr uint16_t EF_ATTLOG = 1;
 
 uint16_t ReadU16(const uint8_t* p) {
@@ -418,7 +415,8 @@ bool ZkDevice::SendCommand(uint16_t command, const std::vector<uint8_t>& data,
   auto packet = MakePacket(command, session_id_, reply_id_, data);
   size_t sent = 0;
   while (sent < packet.size()) {
-    ssize_t n = ::send(fd_, packet.data() + sent, packet.size() - sent, 0);
+    // MSG_NOSIGNAL: a dead device socket must return EPIPE, not kill the process (SIGPIPE).
+    ssize_t n = ::send(fd_, packet.data() + sent, packet.size() - sent, MSG_NOSIGNAL);
     if (n <= 0) {
       err = "Device disconnected";
       return false;
@@ -853,6 +851,11 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
         raw.status = "FAILED";
         raw.error = err + " (got " + std::to_string(blob.size()) + "/" + std::to_string(size) + ")";
         raw.bytes = blob;
+        // Leave prepare mode if the socket is still up. No reconnect and no Enable.
+        std::vector<uint8_t> freply;
+        uint16_t fcmd = 0;
+        std::string e_free;
+        SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
         return false;
       }
       if (c == CMD_DATA) {
@@ -889,125 +892,20 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
 
 bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
                                       std::string& err) {
+  // DG-600 answers CMD_READ_BUFFER in ~1KB pieces and then stops responding.
+  // That stall is what dropped the user sync (SIGPIPE on the next send). Never send it.
+  (void)command;
+  (void)fct;
+  (void)ext;
   raw = RawBlob{};
   raw.label = "buf_cmd_" + std::to_string(command);
-  const int bulk_timeout_ms = std::max(timeout_sec_ * 1000, 180000);
-  // IMPORTANT: Do NOT DisableDevice / RecoverDevice here.
-  // Dg600ReaderPy/pyzk read_with_buffer pulls USERTEMP/ATTLOG without disabling;
-  // EnableDevice after bulk was freezing the panel when it timed out.
-
-  // pyzk: pack('<bhii', 1, command, fct, ext)
-  std::vector<uint8_t> prep;
-  prep.push_back(1);
-  WriteU16(prep, command);
-  auto write_i32 = [](std::vector<uint8_t>& b, int32_t v) {
-    uint32_t u = static_cast<uint32_t>(v);
-    WriteU32(b, u);
-  };
-  write_i32(prep, fct);
-  write_i32(prep, ext);
-
-  std::vector<uint8_t> reply;
-  uint16_t cmd = 0;
-  // Short prepare timeout: if firmware lacks 1503 or hangs, fall back to stream quickly.
-  const int prepare_timeout_ms = std::min(bulk_timeout_ms, 20000);
-  LogInfo("Buffered prepare cmd=" + std::to_string(command) + " fct=" + std::to_string(fct) +
-          " prepare_timeout_ms=" + std::to_string(prepare_timeout_ms));
-  if (!SendCommand(CMD_PREPARE_BUFFER, prep, reply, cmd, err, prepare_timeout_ms)) {
-    raw.status = "FAILED";
-    raw.error = err;
-    raw.reply_cmd = cmd;
-    return false;
-  }
-  raw.reply_cmd = cmd;
-  std::vector<uint8_t> blob;
-
-  if (cmd == CMD_DATA) {
-    blob = std::move(reply);
-  } else {
-    // pyzk: size = unpack('I', data[1:5])
-    if (reply.size() < 5) {
-      raw.status = "FAILED";
-      raw.error = "PREPARE_BUFFER short reply len=" + std::to_string(reply.size());
-      return false;
-    }
-    uint32_t size = ReadU32(reply.data() + 1);
-    LogInfo("PREPARE_BUFFER size=" + std::to_string(size));
-    if (size == 0) {
-      blob.clear();
-    } else if (size > 64u * 1024u * 1024u) {
-      raw.status = "FAILED";
-      raw.error = "PREPARE_BUFFER size too large: " + std::to_string(size);
-      return false;
-    } else {
-      blob.reserve(size);
-      uint32_t start = 0;
-      bool first_chunk = true;
-      while (start < size) {
-        uint32_t need = size - start;
-        if (need > BUF_MAX_CHUNK) need = BUF_MAX_CHUNK;
-        std::vector<uint8_t> req;
-        WriteU32(req, start);
-        WriteU32(req, need);
-        bool got = false;
-        std::string last_err;
-        std::vector<uint8_t> creply;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-          creply.clear();
-          uint16_t ccmd = 0;
-          if (!SendCommand(CMD_READ_BUFFER, req, creply, ccmd, last_err, bulk_timeout_ms)) {
-            continue;
-          }
-          if (ccmd == CMD_DATA || ccmd == CMD_ACK_OK || ccmd == CMD_ACK_DATA) {
-            got = true;
-            break;
-          }
-          last_err = "READ_BUFFER unexpected cmd=" + std::to_string(ccmd);
-        }
-        if (!got) {
-          raw.status = "FAILED";
-          raw.error = last_err + " at offset " + std::to_string(start);
-          raw.bytes = blob;
-          return false;
-        }
-        if (creply.empty()) {
-          // Some firmwares end early with empty DATA; accept what we have.
-          break;
-        }
-        // DG-600 often returns ~1KiB per READ_BUFFER. Advancing by requested `need`
-        // (pyzk uses start = len(buffer)) skipped most of the table and falsely "succeeded".
-        // Tiny chunks on a large buffer also mean hundreds of RTTs → panel lag; abort to stream.
-        if (first_chunk && creply.size() < 4096 && size > 16u * 1024u) {
-          std::vector<uint8_t> freply;
-          uint16_t fcmd = 0;
-          std::string e_free;
-          SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
-          raw.status = "FAILED";
-          raw.error = "buffered chunks too small (" + std::to_string(creply.size()) +
-                      "B); prefer stream";
-          LogWarning(raw.error);
-          return false;
-        }
-        first_chunk = false;
-        blob.insert(blob.end(), creply.begin(), creply.end());
-        start += static_cast<uint32_t>(creply.size());
-        if (blob.size() <= creply.size() || blob.size() % (64u * 1024u) < creply.size()) {
-          LogInfo("buffer progress " + std::to_string(blob.size()) + "/" + std::to_string(size));
-        }
-      }
-    }
-    std::vector<uint8_t> freply;
-    uint16_t fcmd = 0;
-    std::string e_free;
-    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 3000);
-  }
-
-  raw.bytes = std::move(blob);
-  raw.status = raw.bytes.empty() ? "empty" : "ok";
-  LogInfo("Buffered done cmd=" + std::to_string(command) + " bytes=" +
-          std::to_string(raw.bytes.size()));
-  return true;
+  raw.status = "FAILED";
+  err = "refused: buffered READ_BUFFER stalls the DG-600; use the stream read";
+  raw.error = err;
+  LogWarning(err);
+  return false;
 }
+
 
 bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,
                                    RawBlob& raw, std::string& err) {
@@ -1021,17 +919,19 @@ bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vec
     return ok;
   };
 
-  // One attempt on the session already open. A second connect runs EnsureAttendanceSensor
-  // and can send Enable; repeating that is what froze the DG-600 panel.
-  // Attendance uses the continuous stream. User records use the buffered read.
-  if (command == CMD_ATTLOG_RRQ) {
+  // One session already open. Do not reconnect: a second connect can send Enable
+  // and that is what froze the DG-600 panel.
+  // Users and attendance both use one continuous stream. Do not call the buffered reader.
+  (void)fct;
+  if (command == CMD_ATTLOG_RRQ || command == CMD_USERTEMP_RRQ) {
     if (keep_raw(FetchLargeData(command, legacy_req, raw, err))) return true;
-    LogWarning("stream attlog failed, not reconnecting: " + err);
+    LogWarning("stream read failed, not reconnecting: " + err);
     return false;
   }
-
-  if (keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, err))) return true;
-  LogWarning("buffered read failed, not reconnecting: " + err);
+  err = "unsupported bulk command " + std::to_string(command);
+  raw.status = "FAILED";
+  raw.error = err;
+  LogWarning(err + "; not reconnecting");
   return false;
 }
 
