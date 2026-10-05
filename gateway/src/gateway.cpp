@@ -1250,6 +1250,7 @@ int RunGateway(const Config& cfg_in) {
     bool users_pulled = false;
     bool attlog_read_ok = false;
     int user_count = -1;
+    int64_t read_started = 0;
 
     {
       ZkDevice device;
@@ -1269,6 +1270,7 @@ int RunGateway(const Config& cfg_in) {
         }
         device.ReadDeviceInfo(info, local_err);
 
+        read_started = UnixNow();
         if (!device.ReadAttendanceLogs(logs, local_err)) {
           std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(),
                        local_err.c_str());
@@ -1332,15 +1334,25 @@ int RunGateway(const Config& cfg_in) {
     }
     if (!attlog_read_ok) return false;
 
-    // Reconcile from the last successful read. First run uses usage_started_on when set.
-    const int64_t read_started = UnixNow();
+    // Next read overlaps the transfer. The saved mark is 5 minutes before this read started.
+    constexpr int64_t kAttlogOverlapSec = 5 * 60;
     std::string wm_raw;
     std::string meta_wm;
     store.GetMeta("attlog_ok_at:" + tid, wm_raw, meta_wm);
     const int64_t watermark = wm_raw.empty() ? 0 : std::strtoll(wm_raw.c_str(), nullptr, 10);
+    // No mark yet: do not upload the whole device log. Floor is the later of
+    // usage_started_on and the last 3 local days.
+    std::string first_floor;
+    if (watermark <= 0) {
+      first_floor = LocalYmd(-2);
+      if (!t.usage_started_on.empty() && t.usage_started_on > first_floor) {
+        first_floor = t.usage_started_on;
+      }
+    }
     auto mark_watermark = [&]() {
+      if (read_started <= kAttlogOverlapSec) return;
       std::string e;
-      store.SetMeta("attlog_ok_at:" + tid, std::to_string(read_started), e);
+      store.SetMeta("attlog_ok_at:" + tid, std::to_string(read_started - kAttlogOverlapSec), e);
     };
 
     std::vector<AttendanceEvent> filtered;
@@ -1349,16 +1361,17 @@ int RunGateway(const Config& cfg_in) {
       if (!PunchYearOk(ev, cfg.punch_min_year)) continue;
       if (watermark > 0) {
         if (!PunchAtOrAfterUnix(ev, watermark)) continue;
-      } else if (!t.usage_started_on.empty() && !PunchOnOrAfter(ev, t.usage_started_on)) {
+      } else if (!PunchOnOrAfter(ev, first_floor)) {
         continue;
       }
       filtered.push_back(std::move(ev));
     }
     OpsLog(store, "info", "attlog", "attlog_window",
            watermark > 0 ? "Đối soát ATTLOG từ lần đọc thành công trước"
-                         : "Đối soát ATTLOG lần đầu",
+                         : "Đối soát ATTLOG lần đầu trong cửa sổ gần đây",
            {{"ip", t.ip},
             {"watermark", watermark},
+            {"first_floor", first_floor},
             {"usage_started_on", t.usage_started_on},
             {"raw", logs.size()},
             {"kept", filtered.size()}});
