@@ -136,6 +136,8 @@ class ZkDevice {
   const std::string& ConnectWarning() const { return connect_warning_; }
   int Port() const { return port_; }
   const DeviceInfo& LastInfo() const { return info_; }
+  // Bytes of the last ATTLOG table after a successful read. 0 means the body was empty.
+  size_t LastAttlogBytes() const { return last_attlog_bytes_; }
   static const char* ProtocolName() { return "ZKTeco TCP wire protocol (pyzk-compatible)"; }
 
  private:
@@ -172,6 +174,7 @@ class ZkDevice {
   int password_ = 0;
   int timeout_sec_ = 10;
   DeviceInfo info_;
+  size_t last_attlog_bytes_ = 0;
   std::vector<UserRecord> users_cache_;
 };
 

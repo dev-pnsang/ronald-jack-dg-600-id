@@ -1250,6 +1250,7 @@ int RunGateway(const Config& cfg_in) {
     std::vector<UserRecord> users;
     bool users_pulled = false;
     bool attlog_read_ok = false;
+    size_t attlog_bytes = 0;
     int user_count = -1;
     int64_t read_started = 0;
 
@@ -1281,6 +1282,7 @@ int RunGateway(const Config& cfg_in) {
                  {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
         } else {
           attlog_read_ok = true;
+          attlog_bytes = device.LastAttlogBytes();
         }
 
         if (also_users) {
@@ -1325,13 +1327,22 @@ int RunGateway(const Config& cfg_in) {
              {{"ip", t.ip}, {"read", users.size()}, {"device_count", user_count}});
     }
 
-    if (attlog_read_ok && logs.empty() && info.log_count > 0) {
+    if (attlog_read_ok && logs.empty() && info.log_count > 0 && attlog_bytes == 0) {
       attlog_read_ok = false;
       std::fprintf(stderr, "[attlog] %s empty read but device log_count=%d (fingerprint kept)\n",
                    t.ip.c_str(), info.log_count);
       OpsLog(store, "warn", "attlog", "attlog_incomplete",
              "Đọc ATTLOG rỗng trong khi máy vẫn còn nhật ký — không ghi đè fingerprint",
              {{"ip", t.ip}, {"port", t.port}, {"log_count", info.log_count}});
+    } else if (attlog_read_ok && logs.empty() && attlog_bytes > 0) {
+      // The table arrived. Rows were not valid punches. Pulling it again and opening a
+      // second session is what took this DG-600 off the LAN.
+      std::fprintf(stderr,
+                   "[attlog] %s table=%zu bytes has no valid punches (log_count=%d) — not retrying\n",
+                   t.ip.c_str(), attlog_bytes, info.log_count);
+      OpsLog(store, "warn", "attlog", "attlog_no_valid_punches",
+             "Đã đọc hết nhật ký nhưng không có dòng chấm công hợp lệ — không đọc lại ngay",
+             {{"ip", t.ip}, {"port", t.port}, {"bytes", attlog_bytes}, {"log_count", info.log_count}});
     }
     if (!attlog_read_ok) return false;
 
@@ -1581,7 +1592,9 @@ int RunGateway(const Config& cfg_in) {
                "Đọc ATTLOG chưa xong. Khung giờ chưa được đánh dấu",
                {{"failed", attlog_owed.size()}, {"wait_sec", wait}, {"slot", slot}});
       }
-      if (live_was_up) next_live_attempt = UnixNow();
+      // A second TCP session in the same second as ATTLOG made this DG-600 stop answering,
+      // then drop off the LAN. Leave the device alone before live listen.
+      if (live_was_up) next_live_attempt = UnixNow() + 180;
     } else if (users_due) {
       const bool live_was_up = live_device.IsConnected();
       live_device.Disconnect();
@@ -1597,7 +1610,7 @@ int RunGateway(const Config& cfg_in) {
       last_users_sync_slot = users_slot;
       std::string meta_err;
       store.SetMeta("users_last_sync_slot", last_users_sync_slot, meta_err);
-      if (live_was_up) next_live_attempt = UnixNow();
+      if (live_was_up) next_live_attempt = UnixNow() + 180;
     }
 
     now = UnixNow();

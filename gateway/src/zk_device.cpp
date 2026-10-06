@@ -1040,6 +1040,7 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
   }
 
   const size_t n = raw.bytes.size();
+  last_attlog_bytes_ = n;
   // This DG-600 stores 40-byte SSR rows (24-byte PIN, time at byte 24).
   // A short or 16-byte reading is a failed pull, not an empty log.
   if (n == 0) {
