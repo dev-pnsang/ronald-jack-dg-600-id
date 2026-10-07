@@ -139,6 +139,54 @@ std::string SanitizeUtf8Users(const std::string& s) {
   return out;
 }
 
+// Names from the last user-table read, including across restarts, so a punch can
+// carry the person's name even though the user list is a later TCP session.
+std::map<std::string, std::string> g_user_names;
+bool g_user_names_loaded = false;
+
+void LoadUserNames(Store& store) {
+  if (g_user_names_loaded) return;
+  g_user_names_loaded = true;
+  std::string raw;
+  std::string meta_err;
+  store.GetMeta("user_names_json", raw, meta_err);
+  if (raw.empty()) return;
+  try {
+    auto parsed = nlohmann::json::parse(raw);
+    if (!parsed.is_object()) return;
+    for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+      if (!it.value().is_string()) continue;
+      std::string name = it.value().get<std::string>();
+      if (!it.key().empty() && !name.empty()) g_user_names[it.key()] = std::move(name);
+    }
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "[users] name cache parse: %s\n", ex.what());
+  }
+}
+
+void RememberUsers(Store& store, const std::vector<UserRecord>& users) {
+  LoadUserNames(store);
+  bool changed = false;
+  for (const auto& u : users) {
+    if (u.user_id.empty() || u.name.empty()) continue;
+    auto it = g_user_names.find(u.user_id);
+    if (it != g_user_names.end() && it->second == u.name) continue;
+    g_user_names[u.user_id] = u.name;
+    changed = true;
+  }
+  if (!changed) return;
+  nlohmann::json saved = nlohmann::json::object();
+  for (const auto& kv : g_user_names) saved[kv.first] = kv.second;
+  std::string meta_err;
+  store.SetMeta("user_names_json", saved.dump(), meta_err);
+}
+
+void AttachUserName(AttendanceEvent& ev) {
+  if (!ev.user_name.empty() || ev.user_id.empty()) return;
+  auto it = g_user_names.find(ev.user_id);
+  if (it != g_user_names.end()) ev.user_name = it->second;
+}
+
 // Ship short Vietnamese ops messages to CommaDesk Device Monitor (POST /device-ops/logs).
 // Keep codes stable (English snake_case); put human text in `message`.
 void OpsLog(Store& store, const char* level, const char* component, const char* code,
@@ -427,6 +475,8 @@ bool UserCatalogComplete(int device_count, const std::vector<UserRecord>& users)
 
 bool EnqueuePunch(Store& store, const Config& cfg, const DeviceInfo& info, const AttendanceEvent& ev) {
   AttendanceEvent punch = ev;
+  LoadUserNames(store);
+  AttachUserName(punch);
   if (!PunchYearOk(punch, cfg.punch_min_year)) {
     std::fprintf(stderr, "[punch] drop implausible time %s user=%s\n", punch.timestamp_iso.c_str(),
                  punch.user_id.c_str());
@@ -782,6 +832,7 @@ int RunSyncUsers(const Config& cfg_in) {
     return 4;
   }
   device.Disconnect();
+  RememberUsers(store, users);
 
   std::fprintf(stderr, "[users] device returned %zu user(s):\n", users.size());
   for (const auto& u : users) {
@@ -818,6 +869,7 @@ int RunGateway(const Config& cfg_in) {
     std::fprintf(stderr, "store: %s\n", err.c_str());
     return 1;
   }
+  LoadUserNames(store);
   Credential cred;
   if (!store.LoadCredential(cred, err)) {
     std::fprintf(stderr, "Not enrolled: %s\n", err.c_str());
@@ -959,7 +1011,7 @@ int RunGateway(const Config& cfg_in) {
         {"hostname", Hostname()},
         {"agent_name", cfg.agent_name},
         {"agent_version", cfg.agent_version},
-        {"terminal_model", "Ronald Jack DG-600-ID"},
+        {"terminal_model", "T8A"},
     };
     std::string raw = hb.dump();
     auto hr = SignedRequest(cfg, http, cred, "PUT", "/device-identity/heartbeat", raw);
@@ -1207,6 +1259,7 @@ int RunGateway(const Config& cfg_in) {
       device.Disconnect();
     }
 
+    if (!users.empty()) RememberUsers(store, users);
     if (!users.empty() && UserCatalogComplete(user_count, users)) {
       std::string meta_err;
       if (SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users)) {
@@ -1244,12 +1297,17 @@ int RunGateway(const Config& cfg_in) {
             {"also_users", also_users},
             {"usage_started_on", t.usage_started_on}});
 
-    // One TCP session for reads only — disconnect ASAP. No RecoverDevice/Enable after bulk
-    // (that path froze the DG-600 panel when Enable timed out).
+    // T8A: attendance and the user table are each one 1503. Do not send both in the
+    // same TCP session. Exit, and only if that exit is ACK_OK wait 5s and connect
+    // again for users. A failed read or a failed exit does not open the second
+    // session. Live listen still waits 180s after this sync returns.
+    // No RecoverDevice/Enable after a bulk read.
     std::vector<AttendanceEvent> logs;
     std::vector<UserRecord> users;
     bool users_pulled = false;
     bool attlog_read_ok = false;
+    bool exit_ok = false;
+    bool users_after_gap = false;
     size_t attlog_bytes = 0;
     int user_count = -1;
     int64_t read_started = 0;
@@ -1271,6 +1329,7 @@ int RunGateway(const Config& cfg_in) {
                  {{"ip", t.ip}, {"port", t.port}, {"detail", device.ConnectWarning()}});
         }
         device.ReadDeviceInfo(info, local_err);
+        if (info.user_count > 0) user_count = info.user_count;
 
         read_started = UnixNow();
         if (!device.ReadAttendanceLogs(logs, local_err)) {
@@ -1285,34 +1344,59 @@ int RunGateway(const Config& cfg_in) {
           attlog_bytes = device.LastAttlogBytes();
         }
 
-        if (also_users) {
-          bool need_users = true;
-          DeviceInfo sizes_info;
-          RawBlob sizes_raw;
-          if (device.ReadFreeSizes(sizes_info, sizes_raw, local_err)) {
-            user_count = sizes_info.user_count;
-            if (!UsersCatalogDue(store, tid, user_count)) {
-              need_users = false;
-              std::fprintf(stderr, "[users] %s skip ReadUsers (already read today, count=%d)\n",
-                           t.ip.c_str(), user_count);
-            }
-          }
-
-          if (need_users) {
-            if (!device.ReadUsers(users, local_err)) {
-              std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
-              users.clear();
-            } else {
-              users_pulled = true;
-              if (user_count < 0) user_count = static_cast<int>(users.size());
-            }
+        if (also_users && attlog_read_ok) {
+          if (user_count >= 0 && !UsersCatalogDue(store, tid, user_count)) {
+            std::fprintf(stderr, "[users] %s skip ReadUsers (already read today, count=%d)\n",
+                         t.ip.c_str(), user_count);
+          } else {
+            users_after_gap = true;
           }
         }
 
-        device.Disconnect();
+        exit_ok = device.Disconnect();
       }
     }
 
+    if (users_after_gap && !exit_ok) {
+      std::fprintf(stderr, "[users] %s ATTLOG exit failed — not opening a second session\n",
+                   t.ip.c_str());
+      OpsLog(store, "warn", "users", "users_skipped_no_exit",
+             "Không đọc danh sách nhân viên vì phiên nhật ký không thoát sạch",
+             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}});
+    } else if (users_after_gap && g_running) {
+      std::fprintf(stderr, "[users] %s wait 5s before a new session\n", t.ip.c_str());
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      if (g_running) {
+        ZkDevice users_device;
+        users_device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+        if (!users_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec,
+                                  local_err, /*allow_sensor_enable=*/false)) {
+          std::fprintf(stderr, "[users] reconnect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+          OpsLog(store, "warn", "zk", "connect_fail",
+                 "Không kết nối lại được máy chấm công khi đồng bộ user id",
+                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+                  {"phase", "users_after_attlog"}});
+        } else {
+          DeviceInfo users_info;
+          if (users_device.ReadDeviceInfo(users_info, local_err) && users_info.user_count > 0) {
+            user_count = users_info.user_count;
+          }
+          if (!users_device.ReadUsers(users, local_err)) {
+            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+            users.clear();
+            OpsLog(store, "warn", "users", "users_read_fail",
+                   "Đọc danh sách user id từ máy chấm công thất bại",
+                   {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
+          } else {
+            users_pulled = true;
+            if (user_count < 0) user_count = static_cast<int>(users.size());
+          }
+          users_device.Disconnect();
+        }
+      }
+    }
+
+    if (users_pulled) RememberUsers(store, users);
     if (users_pulled && UserCatalogComplete(user_count, users)) {
       std::string meta_err;
       if (SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users)) {
@@ -1507,7 +1591,8 @@ int RunGateway(const Config& cfg_in) {
         (slot_due || attlog_catchup_pending) && !terminals.empty() && now >= next_attlog_attempt;
     const bool users_due =
         !users_slot.empty() && users_slot != last_users_sync_slot && !terminals.empty() && !attlog_due;
-    // Same HH:MM window: one TCP session does ATTLOG + users (avoids double disconnect on DG-600).
+    // Same HH:MM window: ATTLOG, exit, wait 5s, then a new session for users.
+    // The second session is opened only after CMD_EXIT returns ACK_OK.
     const bool users_with_attlog = attlog_due && !users_slot.empty() && users_slot == slot &&
                                    users_slot != last_users_sync_slot;
 

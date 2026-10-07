@@ -15,7 +15,7 @@ bool EnrollDevice(const Config& cfg, const HttpClient& http, const std::string& 
         {"version", cfg.agent_version},
         {"hostname", Hostname()},
         {"device_role", "checkin_gateway"},
-        {"terminal_model", "Ronald Jack DG-600-ID"}}},
+        {"terminal_model", "T8A"}}},
   };
   std::string raw = body.dump();  // compact
   std::string url = cfg.base_url + "/device-identity/enroll";

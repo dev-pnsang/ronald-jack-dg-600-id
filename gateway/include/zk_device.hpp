@@ -89,7 +89,9 @@ class ZkDevice {
   // enable_attempted is set when that one Enable was actually sent.
   bool Connect(const std::string& ip, int port, int password, int timeout_sec, std::string& err,
                bool allow_sensor_enable = true, bool* enable_attempted = nullptr);
-  void Disconnect();
+  // CMD_EXIT then close. True when there was no session, or the device answered ACK_OK.
+  // A failed exit must not be followed by another connection.
+  bool Disconnect();
   void SetTzOffsetMinutes(int offset_min) { tz_offset_min_ = offset_min; }
   bool IsConnected() const { return connected_; }
 
@@ -155,7 +157,8 @@ class ZkDevice {
   bool ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& ev);
   bool FetchLargeData(uint16_t command, const std::vector<uint8_t>& req, RawBlob& raw,
                       std::string& err);
-  // Refuses. CMD_READ_BUFFER in ~1KB chunks stalls this DG-600. Callers use the stream.
+  // T8A attendance (command 13) and users (command 9, fct 5): 1503 then one 1504.
+  // Refuses every other command. DG-600 must keep the stream; see kForceT8AAttendance.
   bool FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
                               std::string& err);
   bool FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vector<uint8_t>& legacy_req,

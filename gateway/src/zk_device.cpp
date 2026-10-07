@@ -33,8 +33,31 @@ constexpr uint16_t CMD_ACK_UNAUTH = 2005;
 constexpr uint16_t CMD_PREPARE_DATA = 1500;
 constexpr uint16_t CMD_DATA = 1501;
 constexpr uint16_t CMD_FREE_DATA = 1502;
+constexpr uint16_t CMD_READ_BUFFER = 1503;
+constexpr uint16_t CMD_READ_CHUNK = 1504;
 constexpr uint16_t CMD_USERTEMP_RRQ = 9;
 constexpr uint16_t CMD_ATTLOG_RRQ = 13;
+// Temporary hardcode: this build reads the T8A at the current site through command
+// 1503, then one 1504. Attendance is command 13 (PIN at byte 2, ZK time at byte 27).
+// Users are command 9 with fct 5, not the fingerprint-template command. A 72-byte
+// user row keeps the existing fields. A 28-byte row uses the short layout. Any
+// other user-row size is refused and is not uploaded.
+// Attendance was proven on ~DeviceName T8A / ~Platform JZ4725_TFT, serial
+// 3259171100927, without Disable or Enable. The user buffer has not been read
+// from that machine yet. DG-600 must not receive 1503: it answers about 1KB and
+// then stops.
+//
+// Planned switch, not active yet. In the same session, before any bulk read, probe
+// ~DeviceName and ~Platform (the platform key, not ~OEMVendor). Send 1503 only when
+// both are T8A and JZ4725_TFT. Any other pair, a missing key, or the two keys
+// disagreeing stays on the DG-600 stream (attendance command 13, PIN at byte 0,
+// time at byte 24; users command 9). Do not fall through to 1503 after the DG-600
+// parser drops every row.
+// The server model is ~DeviceName when that probe succeeded, otherwise T8A.
+// A zero verify or in/out byte on this firmware is not the DG-600 password/in code.
+constexpr bool kForceT8AAttendance = true;
+constexpr uint32_t kT8AAttlogCap = 131072;
+constexpr int kT8AAttlogTimeoutMs = 5000;
 constexpr uint16_t CMD_CLEAR_ATTLOG = 15;
 constexpr uint16_t CMD_DEVICE = 11;
 constexpr uint16_t CMD_GET_TIME = 201;
@@ -212,6 +235,24 @@ std::string BytesToHex(const uint8_t* data, size_t len) {
 }
 
 std::string BytesToHex(const std::vector<uint8_t>& v) { return BytesToHex(v.data(), v.size()); }
+
+// 72 when the body matches the long user row, 28 for the short row, 0 otherwise.
+// Prefer the device user count so a length divisible by both is not guessed.
+size_t T8AUserRecordSize(const std::vector<uint8_t>& bytes, int user_count) {
+  size_t n = bytes.size();
+  if (n >= 4) {
+    const uint32_t maybe = ReadU32(bytes.data());
+    if (maybe > 0 && maybe + 4 == n) n = maybe;
+  }
+  if (user_count > 0) {
+    if (n == static_cast<size_t>(user_count) * 72) return 72;
+    if (n == static_cast<size_t>(user_count) * 28) return 28;
+    return 0;
+  }
+  if (n > 0 && n % 72 == 0 && n % 28 != 0) return 72;
+  if (n > 0 && n % 28 == 0 && n % 72 != 0) return 28;
+  return 0;
+}
 
 }  // namespace
 
@@ -684,17 +725,22 @@ bool ZkDevice::Connect(const std::string& ip, int port, int password, int timeou
   return true;
 }
 
-void ZkDevice::Disconnect() {
+bool ZkDevice::Disconnect() {
+  bool exited = true;
   if (connected_ && fd_ >= 0) {
-    std::string err;
     StopLiveCapture();
+    std::string err;
     std::vector<uint8_t> reply;
     uint16_t cmd = 0;
-    SendCommand(CMD_EXIT, {}, reply, cmd, err, 2000);
+    exited = SendCommand(CMD_EXIT, {}, reply, cmd, err, 2000) && cmd == CMD_ACK_OK;
+    if (!exited) {
+      LogWarning("CMD_EXIT failed cmd=" + std::to_string(cmd) + " " + err);
+    }
   }
   CloseSocket();
   connected_ = false;
   live_ = false;
+  return exited;
 }
 
 bool ZkDevice::GetTime(DeviceTime& out, std::string& err) {
@@ -892,18 +938,135 @@ bool ZkDevice::FetchLargeData(uint16_t command, const std::vector<uint8_t>& req,
 
 bool ZkDevice::FetchLargeDataBuffered(uint16_t command, int32_t fct, int32_t ext, RawBlob& raw,
                                       std::string& err) {
-  // DG-600 answers CMD_READ_BUFFER in ~1KB pieces and then stops responding.
-  // That stall is what dropped the user sync (SIGPIPE on the next send). Never send it.
-  (void)command;
-  (void)fct;
-  (void)ext;
+  // See kForceT8AAttendance. One 1503, at most one 1504, then FREE_DATA.
+  // No retry: repeating 1504 is what holds a panel that stopped answering.
+  // Response session fields are not the connection id (STATE writes the state there).
+  // Every send below restores the CONNECT session first.
   raw = RawBlob{};
   raw.label = "buf_cmd_" + std::to_string(command);
-  raw.status = "FAILED";
-  err = "refused: buffered READ_BUFFER stalls the DG-600; use the stream read";
-  raw.error = err;
-  LogWarning(err);
-  return false;
+  const uint16_t saved_session = session_id_;
+  auto restore = [&]() { session_id_ = saved_session; };
+  auto fail = [&](const std::string& why) {
+    restore();
+    raw.status = "FAILED";
+    raw.error = why;
+    err = why;
+    LogWarning(why);
+    return false;
+  };
+  if (!kForceT8AAttendance) {
+    return fail("refused: buffered READ_BUFFER stalls the DG-600; use the stream read");
+  }
+  if (command != CMD_ATTLOG_RRQ && command != CMD_USERTEMP_RRQ) {
+    return fail("refused: buffered read is hardcoded for T8A attendance and users only");
+  }
+
+  std::vector<uint8_t> req;
+  req.push_back(1);
+  WriteU16(req, command);
+  WriteU32(req, static_cast<uint32_t>(fct));
+  WriteU32(req, static_cast<uint32_t>(ext));
+
+  restore();
+  std::vector<uint8_t> reply;
+  uint16_t cmd = 0;
+  if (!SendCommand(CMD_READ_BUFFER, req, reply, cmd, err, kT8AAttlogTimeoutMs)) {
+    return fail(err.empty() ? "CMD_READ_BUFFER failed" : err);
+  }
+  restore();
+  raw.reply_cmd = cmd;
+
+  auto free_buffer = [&]() {
+    restore();
+    std::vector<uint8_t> freply;
+    uint16_t fcmd = 0;
+    std::string e_free;
+    SendCommand(CMD_FREE_DATA, {}, freply, fcmd, e_free, 2000);
+    restore();
+  };
+  auto drain = [&](const std::vector<uint8_t>& prepare, std::vector<uint8_t>& blob) -> bool {
+    if (prepare.size() < 4) {
+      err = "PREPARE_DATA short";
+      return false;
+    }
+    const uint32_t size = ReadU32(prepare.data());
+    if (size > kT8AAttlogCap) {
+      err = "ATTLOG block " + std::to_string(size) + " exceeds cap";
+      return false;
+    }
+    blob.clear();
+    blob.reserve(size);
+    while (blob.size() < size) {
+      std::vector<uint8_t> chunk;
+      uint16_t c = 0;
+      if (!RecvPacket(chunk, c, err, kT8AAttlogTimeoutMs)) return false;
+      restore();
+      if (c == CMD_DATA) {
+        blob.insert(blob.end(), chunk.begin(), chunk.end());
+        if (blob.size() > kT8AAttlogCap) {
+          err = "ATTLOG block exceeds cap";
+          return false;
+        }
+      } else if (c == CMD_ACK_OK) {
+        break;
+      } else {
+        err = "unexpected chunk cmd=" + std::to_string(c);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::vector<uint8_t> blob;
+  bool need_free = false;
+  if (cmd == CMD_DATA) {
+    blob = reply;
+  } else if (cmd == CMD_PREPARE_DATA) {
+    need_free = true;
+    if (!drain(reply, blob)) {
+      free_buffer();
+      return fail(err);
+    }
+  } else if (cmd == CMD_ACK_OK) {
+    if (reply.size() < 5) return fail("CMD_READ_BUFFER ack too short");
+    const uint32_t size = ReadU32(reply.data() + 1);
+    LogInfo("T8A buffer size=" + std::to_string(size));
+    if (size == 0 || size > kT8AAttlogCap) return fail("CMD_READ_BUFFER size rejected");
+    std::vector<uint8_t> chunk_req;
+    WriteU32(chunk_req, 0);
+    WriteU32(chunk_req, size);
+    restore();
+    std::vector<uint8_t> chunk;
+    uint16_t c2 = 0;
+    if (!SendCommand(CMD_READ_CHUNK, chunk_req, chunk, c2, err, kT8AAttlogTimeoutMs)) {
+      return fail(err.empty() ? "CMD_READ_CHUNK failed" : err);
+    }
+    restore();
+    if (c2 == CMD_DATA) {
+      blob = chunk;
+      need_free = true;
+    } else if (c2 == CMD_PREPARE_DATA) {
+      need_free = true;
+      if (!drain(chunk, blob)) {
+        free_buffer();
+        return fail(err);
+      }
+    } else if (c2 == CMD_ACK_OK) {
+      blob = chunk;
+    } else {
+      return fail("CMD_READ_CHUNK unexpected cmd=" + std::to_string(c2));
+    }
+  } else {
+    return fail("CMD_READ_BUFFER unexpected cmd=" + std::to_string(cmd));
+  }
+
+  if (need_free) free_buffer();
+  restore();
+  raw.bytes = std::move(blob);
+  raw.status = raw.bytes.empty() ? "empty" : "ok";
+  LogInfo("T8A buffered cmd=" + std::to_string(command) + " bytes=" + std::to_string(raw.bytes.size()));
+  err.clear();
+  return true;
 }
 
 
@@ -921,7 +1084,13 @@ bool ZkDevice::FetchLargeDataSmart(uint16_t command, int32_t fct, const std::vec
 
   // One session already open. Do not reconnect: a second connect can send Enable
   // and that is what froze the DG-600 panel.
-  // Users and attendance both use one continuous stream. Do not call the buffered reader.
+  // Attendance and users are hardcoded to the T8A buffer read.
+  // The model switch described on kForceT8AAttendance is not active.
+  if (kForceT8AAttendance && (command == CMD_ATTLOG_RRQ || command == CMD_USERTEMP_RRQ)) {
+    if (keep_raw(FetchLargeDataBuffered(command, fct, 0, raw, err))) return true;
+    LogWarning("T8A buffered read failed, not reconnecting: " + err);
+    return false;
+  }
   (void)fct;
   if (command == CMD_ATTLOG_RRQ || command == CMD_USERTEMP_RRQ) {
     if (keep_raw(FetchLargeData(command, legacy_req, raw, err))) return true;
@@ -946,27 +1115,49 @@ bool ZkDevice::ReadUsersRaw(std::vector<UserRecord>& out, RawBlob& raw, std::str
   if (!FetchLargeDataSmart(CMD_USERTEMP_RRQ, FCT_USER, data, raw, err)) return false;
   raw.label = "CMD_USERTEMP_RRQ_users";
 
-  // Buffered path may prefix a u32 total size (pyzk); stream path is raw 72-byte records.
+  // T8A: 1503/1504 body, 4-byte size prefix, then 28- or 72-byte rows.
+  // DG-600 stream, used when kForceT8AAttendance is false: raw 72-byte rows.
+  size_t rec = 72;
+  if (kForceT8AAttendance) {
+    rec = T8AUserRecordSize(raw.bytes, info_.user_count);
+    if (rec != 28 && rec != 72) {
+      err = "T8A user table " + std::to_string(raw.bytes.size()) +
+            " bytes is not 28 or 72 per user (count=" + std::to_string(info_.user_count) +
+            "); not uploading";
+      LogWarning(err);
+      return false;
+    }
+  }
+
   size_t base = 0;
   if (raw.bytes.size() >= 4) {
     uint32_t maybe = ReadU32(raw.bytes.data());
     if (maybe > 0 && maybe + 4 == raw.bytes.size()) {
       base = 4;
-    } else if ((raw.bytes.size() % 72) != 0 && ((raw.bytes.size() - 4) % 72) == 0) {
+    } else if (!kForceT8AAttendance && (raw.bytes.size() % 72) != 0 &&
+               ((raw.bytes.size() - 4) % 72) == 0) {
       base = 4;
     }
   }
 
-  const size_t rec = 72;
   for (size_t off = base; off + rec <= raw.bytes.size(); off += rec) {
     const uint8_t* p = raw.bytes.data() + off;
     UserRecord u;
     u.uid = ReadU16(p);
     u.privilege = p[2];
-    u.password = CleanTextField(p + 3, 8);
-    u.name = CleanTextField(p + 11, 24);
-    u.card = ReadU32(p + 35);
-    u.user_id = CleanTextField(p + 48, 24);
+    if (rec == 28) {
+      // pyzk '<HB5s8sIxBhI': password 5, name 8 at byte 8, card at 16, user id uint32 at 24.
+      u.password = CleanTextField(p + 3, 5);
+      u.name = CleanTextField(p + 8, 8);
+      u.card = ReadU32(p + 16);
+      const uint32_t user_id_num = ReadU32(p + 24);
+      if (user_id_num != 0) u.user_id = std::to_string(user_id_num);
+    } else {
+      u.password = CleanTextField(p + 3, 8);
+      u.name = CleanTextField(p + 11, 24);
+      u.card = ReadU32(p + 35);
+      u.user_id = CleanTextField(p + 48, 24);
+    }
     if (u.user_id.empty()) {
       if (u.uid == 0) continue;
       u.user_id = std::to_string(u.uid);
@@ -975,7 +1166,17 @@ bool ZkDevice::ReadUsersRaw(std::vector<UserRecord>& out, RawBlob& raw, std::str
     u.raw_hex = BytesToHex(p, rec);
     out.push_back(u);
   }
+  if (kForceT8AAttendance && info_.user_count > 0 &&
+      static_cast<int>(out.size()) != info_.user_count) {
+    err = "T8A user rows " + std::to_string(out.size()) + " != device count " +
+          std::to_string(info_.user_count) + "; not uploading";
+    LogWarning(err);
+    out.clear();
+    users_cache_.clear();
+    return false;
+  }
   users_cache_ = out;
+  LogInfo("users parsed rows=" + std::to_string(out.size()) + " rec=" + std::to_string(rec));
   return true;
 }
 
@@ -1041,7 +1242,8 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
 
   const size_t n = raw.bytes.size();
   last_attlog_bytes_ = n;
-  // This DG-600 stores 40-byte SSR rows (24-byte PIN, time at byte 24).
+  // Hardcoded T8A row: uint16 uid, PIN at byte 2, status at 26, ZK time at 27, punch at 31.
+  // DG-600 row, used when kForceT8AAttendance is false: PIN at byte 0, time at byte 24.
   // A short or 16-byte reading is a failed pull, not an empty log.
   if (n == 0) {
     LogInfo("ATTLOG empty");
@@ -1053,7 +1255,8 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
     return false;
   }
   const size_t rec = 40;
-  const size_t time_off = 24;
+  const size_t pin_off = kForceT8AAttendance ? 2 : 0;
+  const size_t time_off = kForceT8AAttendance ? 27 : 24;
   const size_t pin_len = 24;
 
   std::string received = UtcNowIso8601();
@@ -1061,7 +1264,7 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
   int dropped = 0;
   for (size_t off = 0; off + rec <= n; off += rec) {
     const uint8_t* p = raw.bytes.data() + off;
-    std::string pin = LeadingPin(p, pin_len);
+    std::string pin = LeadingPin(p + pin_off, pin_len);
     if (pin.empty() || pin == "0") {
       ++dropped;
       continue;
@@ -1078,9 +1281,16 @@ bool ZkDevice::ReadAttendanceLogsRaw(std::vector<AttendanceEvent>& out, RawBlob&
     }
     ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second,
                                            tz_offset_min_);
-    if (time_off + 4 < rec) ev.verify_mode = p[time_off + 4];
-    if (time_off + 5 < rec) ev.inout_mode = p[time_off + 5];
-    if (time_off + 6 < rec) ev.work_code = p[time_off + 6];
+    if (kForceT8AAttendance) {
+      // Both bytes are 0 on every row read from this T8A. That is not DG-600
+      // "in" / "password". Leave them unset so the server is not told a mode.
+      ev.inout_mode = p[26] == 0 ? -1 : p[26];
+      ev.verify_mode = p[31] == 0 ? -1 : p[31];
+    } else {
+      if (time_off + 4 < rec) ev.verify_mode = p[time_off + 4];
+      if (time_off + 5 < rec) ev.inout_mode = p[time_off + 5];
+      if (time_off + 6 < rec) ev.work_code = p[time_off + 6];
+    }
     ev.raw_hex = BytesToHex(p, rec);
     for (const auto& u : users_cache_) {
       if (u.user_id == ev.user_id) {
@@ -1183,8 +1393,14 @@ bool ZkDevice::ParseAttEvent(const std::vector<uint8_t>& data, AttendanceEvent& 
   ev.timestamp_iso = FormatIso8601Offset(ev.year, ev.month, ev.day, ev.hour, ev.minute, ev.second, tz_offset_min_);
 
   size_t status_off = time_off + 4;
-  if (time_ok && status_off < data.size()) ev.verify_mode = data[status_off];
-  if (time_ok && status_off + 1 < data.size()) ev.inout_mode = data[status_off + 1];
+  if (time_ok && status_off < data.size()) {
+    ev.verify_mode = data[status_off];
+    if (kForceT8AAttendance && ev.verify_mode == 0) ev.verify_mode = -1;
+  }
+  if (time_ok && status_off + 1 < data.size()) {
+    ev.inout_mode = data[status_off + 1];
+    if (kForceT8AAttendance && ev.inout_mode == 0) ev.inout_mode = -1;
+  }
   if (time_ok && status_off + 2 < data.size()) ev.work_code = data[status_off + 2];
 
   for (const auto& u : users_cache_) {

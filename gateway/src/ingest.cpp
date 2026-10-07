@@ -70,10 +70,17 @@ std::string BuildIngestBody(const AttendanceEvent& ev, const DeviceInfo& device,
   j["employee_code"] = SanitizeUtf8Local(ev.user_id);
   j["device_user_id"] = SanitizeUtf8Local(ev.user_id);
   if (!ev.user_name.empty()) j["user_name"] = SanitizeUtf8Local(ev.user_name);
-  j["verify_mode"] = ev.verify_mode;
-  j["verify_mode_text"] = VerifyModeText(ev.verify_mode);
-  j["inout_mode"] = ev.inout_mode;
-  j["inout_mode_text"] = InOutModeText(ev.inout_mode);
+  // Negative means the T8A byte was 0. Do not send DG-600 "password" or "in".
+  if (ev.verify_mode >= 0) {
+    j["verify_mode"] = ev.verify_mode;
+    const char* text = VerifyModeText(ev.verify_mode);
+    if (text != nullptr && text[0] != '\0') j["verify_mode_text"] = text;
+  }
+  if (ev.inout_mode >= 0) {
+    j["inout_mode"] = ev.inout_mode;
+    const char* text = InOutModeText(ev.inout_mode);
+    if (text != nullptr && text[0] != '\0') j["inout_mode_text"] = text;
+  }
   j["work_code"] = ev.work_code;
   j["received_at"] =
       SanitizeUtf8Local(ev.received_at_iso.empty() ? ev.timestamp_iso : ev.received_at_iso);
@@ -85,7 +92,8 @@ std::string BuildIngestBody(const AttendanceEvent& ev, const DeviceInfo& device,
   device_j["serial"] = SanitizeUtf8Local(device.serial);
   device_j["firmware"] = SanitizeUtf8Local(device.firmware);
   device_j["platform"] = SanitizeUtf8Local(device.platform);
-  device_j["model"] = "Ronald Jack DG-600-ID";
+  // ~DeviceName when the probe worked. This build's machine is T8A.
+  device_j["model"] = SanitizeUtf8Local(device.device_name.empty() ? "T8A" : device.device_name);
   j["device"] = device_j;
 
   nlohmann::json agent_j;
