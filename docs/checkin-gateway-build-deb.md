@@ -115,8 +115,8 @@ Lịch đồng bộ (giờ local trên gateway, cửa sổ ~90s đầu HH:MM):
 
 | Key | Việc | Mặc định |
 |-----|------|----------|
-| `attlog_sync_times` | Kéo ATTLOG → ingest | `00:00,12:00` |
-| `users_sync_times` | Kéo user id → `/checkin/machine-users` | `00:00,12:00` (có thể khác, vd. `06:00`) |
+| `attlog_sync_times` | Kéo ATTLOG → ingest | `12:00,23:00` |
+| `users_sync_times` | Kéo user id → `/checkin/machine-users` | `12:00,23:00` (có thể khác, vd. `06:00`) |
 
 Chạy tay user: `sudo checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --sync-users`
 

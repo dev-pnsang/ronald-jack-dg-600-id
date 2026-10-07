@@ -288,7 +288,7 @@ std::string LatestPassedSyncSlot(const std::string& times_csv) {
   std::time_t now = std::time(nullptr);
   std::tm tmb{};
   localtime_r(&now, &tmb);
-  std::string csv = times_csv.empty() ? "00:00,12:00" : times_csv;
+  std::string csv = times_csv.empty() ? "12:00,23:00" : times_csv;
   std::stringstream ss(csv);
   std::string part;
   std::string best;
@@ -314,7 +314,7 @@ std::string CurrentAttlogSyncSlot(const std::string& times_csv) {
   std::time_t now = std::time(nullptr);
   std::tm tmb{};
   localtime_r(&now, &tmb);
-  std::string csv = times_csv.empty() ? "00:00,12:00" : times_csv;
+  std::string csv = times_csv.empty() ? "12:00,23:00" : times_csv;
   std::stringstream ss(csv);
   std::string part;
   while (std::getline(ss, part, ',')) {

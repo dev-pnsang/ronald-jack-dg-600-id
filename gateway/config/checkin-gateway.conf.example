@@ -16,7 +16,7 @@ data_dir=/var/lib/checkin-gateway
 agent_name=checkin-gateway
 agent_version=1.2.8
 
-# ATTLOG: gateway syncs twice daily at local 00:00 and 12:00 only,
+# ATTLOG: gateway syncs twice daily at local 12:00 and 23:00 only,
 # filtering punches from attendance_devices.usage_started_on; skips if fingerprint unchanged.
 live_listen=true
 # Also pull ATTLOG periodically (covers missed live events after reconnect)
@@ -24,9 +24,9 @@ poll_fallback=false
 # Pull attendance_devices (with IP) from server and poll each terminal
 discover_terminals=true
 catalog_refresh_sec=300
-attlog_sync_times=00:00,12:00
+attlog_sync_times=12:00,23:00
 # Machine user-id catalog (PUT /checkin/machine-users). May differ from ATTLOG, e.g. 06:00
-users_sync_times=00:00,12:00
+users_sync_times=12:00,23:00
 bootstrap_refresh_sec=300
 poll_interval_sec=43200
 

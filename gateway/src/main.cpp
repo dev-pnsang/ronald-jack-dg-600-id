@@ -18,7 +18,7 @@ void Usage(const char* argv0) {
   std::fprintf(stderr,
                "Usage:\n"
                "  %s --config <path>\n"
-               "      Run checkin gateway (ATTLOG sync 00:00/12:00 + CommaDesk ingest)\n"
+               "      Run checkin gateway (ATTLOG sync 12:00/23:00 + CommaDesk ingest)\n"
                "  %s --config <path> --enroll <pairing_code>\n"
                "  %s --config <path> --ack-rotate <secrets.json>\n"
                "  %s --config <path> --status\n"
@@ -207,9 +207,9 @@ int main(int argc, char** argv) {
     std::fprintf(stdout, "device_port=%d\n", cfg.device_port);
     std::fprintf(stdout, "discover_terminals=%s\n", cfg.discover_terminals ? "true" : "false");
     std::fprintf(stdout, "attlog_sync=%s\n",
-                 cfg.attlog_sync_times.empty() ? "00:00,12:00" : cfg.attlog_sync_times.c_str());
+                 cfg.attlog_sync_times.empty() ? "12:00,23:00" : cfg.attlog_sync_times.c_str());
     std::fprintf(stdout, "users_sync=%s\n",
-                 cfg.users_sync_times.empty() ? "00:00,12:00" : cfg.users_sync_times.c_str());
+                 cfg.users_sync_times.empty() ? "12:00,23:00" : cfg.users_sync_times.c_str());
     std::fprintf(stdout, "enrolled=%s\n", enrolled ? "true" : "false");
     if (enrolled) std::fprintf(stdout, "device_id=%s\n", device_id.c_str());
     return 0;

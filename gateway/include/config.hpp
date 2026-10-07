@@ -32,11 +32,11 @@ struct Config {
   bool discover_terminals = true;
   int catalog_refresh_sec = 300;      // refresh terminal list only (no ATTLOG)
   // Local HH:MM slots for ATTLOG bulk sync (comma-separated, from bootstrap)
-  std::string attlog_sync_times = "00:00,12:00";
+  std::string attlog_sync_times = "12:00,23:00";
   // Local HH:MM slots for machine user-id catalog sync (independent of ATTLOG)
-  std::string users_sync_times = "00:00,12:00";
+  std::string users_sync_times = "12:00,23:00";
   int bootstrap_refresh_sec = 300;
-  int poll_interval_sec = 43200;     // unused — ATTLOG at 00:00 & 12:00 only
+  int poll_interval_sec = 43200;     // unused — ATTLOG at 12:00 & 23:00 only
   bool ingest_minimal = false;     // only attendance_code + timestamp
   // Device wall-clock TZ offset east of UTC in minutes (420 = Asia/Ho_Chi_Minh)
   int device_tz_offset_min = 420;

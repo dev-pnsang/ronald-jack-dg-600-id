@@ -32,7 +32,7 @@ sudo checkin-gatewayctl status
 ```
 
 Service uses `/etc/checkin-gateway/checkin-gateway.conf` and state in `/var/lib/checkin-gateway`.
-- **ATTLOG** (nhật ký chấm công): `attlog_sync_times` — mặc định local **00:00,12:00**. Gateway chỉ đọc và gửi lên server. Không xóa ATTLOG trên máy.
+- **ATTLOG** (nhật ký chấm công): `attlog_sync_times` — mặc định local **12:00,23:00**. Gateway chỉ đọc và gửi lên server. Không xóa ATTLOG trên máy.
 - Khi kết nối, gateway đọc trạng thái máy (`CMD_STATE_RRQ`). Đang nhận vân tay thì giữ nguyên. Đang chờ (state 0) thì bật cảm biến một lần, không thử lại, không tắt cảm biến.
 - **User id** (`PUT /checkin/machine-users`): `users_sync_times` — mặc định giống ATTLOG; có thể đặt khác (vd. `06:00`)
 
