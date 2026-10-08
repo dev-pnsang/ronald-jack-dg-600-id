@@ -32,13 +32,17 @@ void Usage(const char* argv0) {
                "  %s --config <path> --discover|--sync-time|--sync-users|--listen [--result-dir <dir>]\n"
                "  %s --config <path> --sync-full-user\n"
                "      Read every user on the terminal and PUT /checkin/machine-users\n"
+               "  %s --config <path> --sync-attlog\n"
+               "      Read ATTLOG now and enqueue ingest. Does not delete logs on the device.\n"
+               "      Stops checkin-gateway while reading, then starts it again.\n"
+               "      --sync-attendee is the same command.\n"
                "  %s --config <path> --sync-realtime-checkin-off\n"
                "      Persist live_listen=false. Restart checkin-gateway to apply.\n"
                "  %s --config <path> --sync-realtime-checkin-on\n"
                "      Persist live_listen=true. Restart checkin-gateway to apply.\n"
                "\n"
                "Options: --log-level debug|info|warning|error\n",
-               argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+               argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 std::string DefaultResultDir() {
@@ -62,6 +66,7 @@ int main(int argc, char** argv) {
   bool discover = false;
   bool sync_time = false;
   bool sync_users = false;
+  bool sync_attlog = false;
   bool realtime_off = false;
   bool realtime_on = false;
   bool listen = false;
@@ -87,6 +92,9 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--sync-users") == 0 ||
                std::strcmp(argv[i], "--sync-full-user") == 0) {
       sync_users = true;
+    } else if (std::strcmp(argv[i], "--sync-attlog") == 0 ||
+               std::strcmp(argv[i], "--sync-attendee") == 0) {
+      sync_attlog = true;
     } else if (std::strcmp(argv[i], "--sync-realtime-checkin-off") == 0) {
       realtime_off = true;
     } else if (std::strcmp(argv[i], "--sync-realtime-checkin-on") == 0) {
@@ -149,7 +157,8 @@ int main(int argc, char** argv) {
 
   int mode_count = static_cast<int>(enroll) + static_cast<int>(ack_rotate) +
                    static_cast<int>(discover) + static_cast<int>(sync_time) +
-                   static_cast<int>(sync_users) + static_cast<int>(listen) +
+                   static_cast<int>(sync_users) + static_cast<int>(sync_attlog) +
+                   static_cast<int>(listen) +
                    static_cast<int>(realtime_off) + static_cast<int>(realtime_on) +
                    static_cast<int>(device_set) + static_cast<int>(server_set) +
                    static_cast<int>(status);
@@ -260,6 +269,9 @@ int main(int argc, char** argv) {
   }
   if (sync_users) {
     return cg::RunSyncUsers(cfg);
+  }
+  if (sync_attlog) {
+    return cg::RunSyncAttlog(cfg);
   }
   if (listen) {
     return cg::RunListen(cfg, result_dir);

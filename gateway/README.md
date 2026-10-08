@@ -38,6 +38,8 @@ Service uses `/etc/checkin-gateway/checkin-gateway.conf` and state in `/var/lib/
 
 One-shot full user sync: `checkin-gateway --config … --sync-full-user` (same upload as `--sync-users`).
 
+One-shot ATTLOG sync: `checkin-gateway --config … --sync-attlog` (alias `--sync-attendee`). If `checkin-gateway` is running, the command stops it, reads attendance, waits 180 seconds, then starts the service again. It does not delete ATTLOG on the device.
+
 Realtime listen is **off** unless `live_listen=true`. Toggle a running install with `--sync-realtime-checkin-off` or `--sync-realtime-checkin-on`, then restart the service. Scheduled ATTLOG sync still runs.
 
 ## Source of truth

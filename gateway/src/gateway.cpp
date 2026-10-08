@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "capture.hpp"
@@ -751,6 +752,268 @@ int RunAckRotate(const Config& cfg, const std::string& secrets_json_path) {
   return 0;
 }
 
+struct TerminalTarget {
+  std::string id;
+  std::string name;
+  std::string ip;
+  int port = 4370;
+  std::string usage_started_on;  // YYYY-MM-DD inclusive
+};
+
+bool SyncTerminalAttlog(Config& cfg, Store& store, HttpClient& http, Credential& cred,
+                        const TerminalTarget& t, bool also_users) {
+  DeviceInfo info;
+  info.ip = t.ip;
+  info.port = t.port;
+  std::string local_err;
+  const std::string tid = t.id.empty() ? t.ip : t.id;
+  std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s users=%d\n", t.name.c_str(),
+               t.id.c_str(), t.ip.c_str(), t.port,
+               "last-success",
+               also_users ? 1 : 0);
+  OpsLog(store, "info", "attlog", "attlog_start",
+         "Bắt đầu đồng bộ nhật ký chấm công (ATTLOG) từ máy",
+         {{"ip", t.ip},
+          {"port", t.port},
+          {"name", t.name},
+          {"also_users", also_users},
+          {"usage_started_on", t.usage_started_on}});
+
+  // T8A: attendance and the user table are each one 1503. Do not send both in the
+  // same TCP session. Exit, and only if that exit is ACK_OK wait 5s and connect
+  // again for users. A failed read or a failed exit does not open the second
+  // session. Live listen still waits 180s after this sync returns.
+  // No RecoverDevice/Enable after a bulk read.
+  std::vector<AttendanceEvent> logs;
+  std::vector<UserRecord> users;
+  bool users_pulled = false;
+  bool attlog_read_ok = false;
+  bool exit_ok = false;
+  bool users_after_gap = false;
+  size_t attlog_bytes = 0;
+  int user_count = -1;
+  int64_t read_started = 0;
+
+  {
+    ZkDevice device;
+    device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+    if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err,
+                        /*allow_sensor_enable=*/false)) {
+      std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+      OpsLog(store, "warn", "zk", "connect_fail",
+             "Không kết nối được máy chấm công khi đồng bộ ATTLOG",
+             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+              {"phase", "attlog_sync"}});
+    } else {
+      if (!device.ConnectWarning().empty()) {
+        OpsLog(store, "warn", "zk", "sensor_state_skipped",
+               "Không đọc được trạng thái cảm biến. Vẫn đọc ATTLOG",
+               {{"ip", t.ip}, {"port", t.port}, {"detail", device.ConnectWarning()}});
+      }
+      device.ReadDeviceInfo(info, local_err);
+      if (info.user_count > 0) user_count = info.user_count;
+
+      read_started = UnixNow();
+      if (!device.ReadAttendanceLogs(logs, local_err)) {
+        std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(),
+                     local_err.c_str());
+        logs.clear();
+        OpsLog(store, "warn", "attlog", "attlog_read_fail",
+               "Đọc nhật ký chấm công từ máy thất bại",
+               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
+      } else {
+        attlog_read_ok = true;
+        attlog_bytes = device.LastAttlogBytes();
+      }
+
+      if (also_users && attlog_read_ok) {
+        if (user_count >= 0 && !UsersCatalogDue(store, tid, user_count)) {
+          std::fprintf(stderr, "[users] %s skip ReadUsers (already read today, count=%d)\n",
+                       t.ip.c_str(), user_count);
+        } else {
+          users_after_gap = true;
+        }
+      }
+
+      exit_ok = device.Disconnect();
+    }
+  }
+
+  if (users_after_gap && !exit_ok) {
+    std::fprintf(stderr, "[users] %s ATTLOG exit failed — not opening a second session\n",
+                 t.ip.c_str());
+    OpsLog(store, "warn", "users", "users_skipped_no_exit",
+           "Không đọc danh sách nhân viên vì phiên nhật ký không thoát sạch",
+           {{"ip", t.ip}, {"port", t.port}, {"name", t.name}});
+  } else if (users_after_gap && g_running) {
+    std::fprintf(stderr, "[users] %s wait 5s before a new session\n", t.ip.c_str());
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    if (g_running) {
+      ZkDevice users_device;
+      users_device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
+      if (!users_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec,
+                                local_err, /*allow_sensor_enable=*/false)) {
+        std::fprintf(stderr, "[users] reconnect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
+        OpsLog(store, "warn", "zk", "connect_fail",
+               "Không kết nối lại được máy chấm công khi đồng bộ user id",
+               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
+                {"phase", "users_after_attlog"}});
+      } else {
+        DeviceInfo users_info;
+        if (users_device.ReadDeviceInfo(users_info, local_err) && users_info.user_count > 0) {
+          user_count = users_info.user_count;
+        }
+        if (!users_device.ReadUsers(users, local_err)) {
+          std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
+          users.clear();
+          OpsLog(store, "warn", "users", "users_read_fail",
+                 "Đọc danh sách user id từ máy chấm công thất bại",
+                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
+        } else {
+          users_pulled = true;
+          if (user_count < 0) user_count = static_cast<int>(users.size());
+        }
+        users_device.Disconnect();
+      }
+    }
+  }
+
+  if (users_pulled) RememberUsers(store, users);
+  if (users_pulled && UserCatalogComplete(user_count, users)) {
+    std::string meta_err;
+    if (SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users)) {
+      store.SetMeta("users_count:" + tid, std::to_string(users.size()), meta_err);
+      store.SetMeta("users_read_on:" + tid, LocalYmd(0), meta_err);
+    }
+  } else if (users_pulled) {
+    std::fprintf(stderr, "[users] %s incomplete catalog read=%zu device_count=%d (not uploaded)\n",
+                 t.ip.c_str(), users.size(), user_count);
+    OpsLog(store, "warn", "users", "users_incomplete",
+           "Đọc danh sách nhân viên không đủ so với máy — không ghi đè catalog",
+           {{"ip", t.ip}, {"read", users.size()}, {"device_count", user_count}});
+  }
+
+  if (attlog_read_ok && logs.empty() && info.log_count > 0 && attlog_bytes == 0) {
+    attlog_read_ok = false;
+    std::fprintf(stderr, "[attlog] %s empty read but device log_count=%d (fingerprint kept)\n",
+                 t.ip.c_str(), info.log_count);
+    OpsLog(store, "warn", "attlog", "attlog_incomplete",
+           "Đọc ATTLOG rỗng trong khi máy vẫn còn nhật ký — không ghi đè fingerprint",
+           {{"ip", t.ip}, {"port", t.port}, {"log_count", info.log_count}});
+  } else if (attlog_read_ok && logs.empty() && attlog_bytes > 0) {
+    // The table arrived. Rows were not valid punches. Pulling it again and opening a
+    // second session is what took this DG-600 off the LAN.
+    std::fprintf(stderr,
+                 "[attlog] %s table=%zu bytes has no valid punches (log_count=%d) — not retrying\n",
+                 t.ip.c_str(), attlog_bytes, info.log_count);
+    OpsLog(store, "warn", "attlog", "attlog_no_valid_punches",
+           "Đã đọc hết nhật ký nhưng không có dòng chấm công hợp lệ — không đọc lại ngay",
+           {{"ip", t.ip}, {"port", t.port}, {"bytes", attlog_bytes}, {"log_count", info.log_count}});
+  }
+  if (!attlog_read_ok) return false;
+
+  // Next read overlaps the transfer. The saved mark is 5 minutes before this read started.
+  constexpr int64_t kAttlogOverlapSec = 5 * 60;
+  std::string wm_raw;
+  std::string meta_wm;
+  store.GetMeta("attlog_ok_at:" + tid, wm_raw, meta_wm);
+  const int64_t watermark = wm_raw.empty() ? 0 : std::strtoll(wm_raw.c_str(), nullptr, 10);
+  // No mark yet: do not upload the whole device log. Floor is the later of
+  // usage_started_on and the last 3 local days.
+  std::string first_floor;
+  if (watermark <= 0) {
+    first_floor = LocalYmd(-2);
+    if (!t.usage_started_on.empty() && t.usage_started_on > first_floor) {
+      first_floor = t.usage_started_on;
+    }
+  }
+  auto mark_watermark = [&]() {
+    if (read_started <= kAttlogOverlapSec) return;
+    std::string e;
+    store.SetMeta("attlog_ok_at:" + tid, std::to_string(read_started - kAttlogOverlapSec), e);
+  };
+
+  std::vector<AttendanceEvent> filtered;
+  filtered.reserve(logs.size());
+  for (auto& ev : logs) {
+    if (!PunchYearOk(ev, cfg.punch_min_year)) continue;
+    if (watermark > 0) {
+      if (!PunchAtOrAfterUnix(ev, watermark)) continue;
+    } else if (!PunchOnOrAfter(ev, first_floor)) {
+      continue;
+    }
+    filtered.push_back(std::move(ev));
+  }
+  OpsLog(store, "info", "attlog", "attlog_window",
+         watermark > 0 ? "Đối soát ATTLOG từ lần đọc thành công trước"
+                       : "Đối soát ATTLOG lần đầu trong cửa sổ gần đây",
+         {{"ip", t.ip},
+          {"watermark", watermark},
+          {"first_floor", first_floor},
+          {"usage_started_on", t.usage_started_on},
+          {"raw", logs.size()},
+          {"kept", filtered.size()}});
+
+  std::string fp = FingerprintEvents(filtered);
+  std::string fp_key = "attlog_fp:" + tid;
+  std::string prev_fp;
+  std::string meta_err;
+  store.GetMeta(fp_key, prev_fp, meta_err);
+  if (!prev_fp.empty() && prev_fp == fp) {
+    bool missing = false;
+    for (const auto& ev : filtered) {
+      if (!store.SeenDedupe(DedupeKey(ev))) {
+        missing = true;
+        break;
+      }
+    }
+    if (!missing) {
+      std::fprintf(stderr, "[attlog] %s unchanged fp=%s (skip ingest)\n", t.ip.c_str(), fp.c_str());
+      OpsLog(store, "info", "attlog", "attlog_unchanged",
+             "Nhật ký chấm công không đổi — bỏ qua gửi lên server",
+             {{"ip", t.ip}, {"port", t.port}, {"raw", logs.size()}, {"filtered", filtered.size()},
+              {"fp", fp}});
+      mark_watermark();
+      return true;
+    }
+    std::fprintf(stderr, "[attlog] %s fp unchanged but some punches are not ingested yet\n",
+                 t.ip.c_str());
+  }
+
+  int enq = 0;
+  int already = 0;
+  bool enqueue_failed = false;
+  for (auto& ev : filtered) {
+    ev.from_live = false;
+    if (store.SeenDedupe(DedupeKey(ev))) {
+      ++already;
+      continue;
+    }
+    if (!EnqueuePunch(store, cfg, info, ev)) enqueue_failed = true;
+    else ++enq;
+  }
+  if (!enqueue_failed) store.SetMeta(fp_key, fp, meta_err);
+  std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d already=%d fp=%s\n",
+               t.ip.c_str(), filtered.size(), logs.size(), enq, already, fp.c_str());
+  OpsLog(store, "info", "attlog", "attlog_enqueued",
+         "Đã đưa nhật ký chấm công vào hàng đợi gửi lên server",
+         {{"ip", t.ip},
+          {"port", t.port},
+          {"name", t.name},
+          {"raw", logs.size()},
+          {"filtered", filtered.size()},
+          {"enqueued", enq},
+          {"already_seen", already},
+          {"fp", fp}});
+
+  std::fprintf(stderr, "[attlog] %s kept device ATTLOG after enqueue=%d\n", t.ip.c_str(), enq);
+  OpsLog(store, "info", "attlog", "attlog_kept",
+         "Giữ nguyên nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
+         {{"ip", t.ip}, {"enqueued", enq}});
+  if (!enqueue_failed) mark_watermark();
+  return !enqueue_failed;
+}
+
 int RunSyncUsers(const Config& cfg_in) {
   Config cfg = cfg_in;
   std::string err;
@@ -852,6 +1115,143 @@ int RunSyncUsers(const Config& cfg_in) {
   return 0;
 }
 
+bool SystemctlOk(int rc) {
+  return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+}
+
+// Stops checkin-gateway only when it is active, then starts it again on the way out.
+// After a device session, waits 180s before start — the same gap the service uses
+// before opening another TCP session after ATTLOG.
+struct GatewayServicePause {
+  bool resume = false;
+  bool device_session = false;
+
+  bool StopIfActive() {
+    if (!SystemctlOk(std::system("systemctl is-active --quiet checkin-gateway.service"))) {
+      std::fprintf(stderr, "[attlog] checkin-gateway is not running\n");
+      return true;
+    }
+    std::fprintf(stderr, "[attlog] stopping checkin-gateway\n");
+    if (!SystemctlOk(std::system("systemctl stop checkin-gateway.service"))) {
+      std::fprintf(stderr, "[attlog] could not stop checkin-gateway; not opening a second TCP session\n");
+      return false;
+    }
+    if (SystemctlOk(std::system("systemctl is-active --quiet checkin-gateway.service"))) {
+      std::fprintf(stderr, "[attlog] checkin-gateway is still active after stop\n");
+      return false;
+    }
+    resume = true;
+    return true;
+  }
+
+  void Start() {
+    if (!resume) return;
+    resume = false;
+    if (device_session) {
+      std::fprintf(stderr, "[attlog] waiting 180s before starting checkin-gateway\n");
+      std::this_thread::sleep_for(std::chrono::seconds(180));
+    }
+    std::fprintf(stderr, "[attlog] starting checkin-gateway\n");
+    if (!SystemctlOk(std::system("systemctl start checkin-gateway.service"))) {
+      std::fprintf(stderr, "[attlog] could not start checkin-gateway\n");
+    }
+  }
+
+  ~GatewayServicePause() { Start(); }
+};
+
+int RunSyncAttlog(const Config& cfg_in) {
+  GatewayServicePause service;
+  if (!service.StopIfActive()) return 1;
+
+  Config cfg = cfg_in;
+  std::string err;
+  if (!EnsureDir(cfg.data_dir, err)) {
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return 1;
+  }
+  SetCaptureDir(cfg.data_dir);
+  Store store;
+  if (!store.Open(cfg.data_dir + "/state.db", err)) {
+    std::fprintf(stderr, "store: %s\n", err.c_str());
+    return 1;
+  }
+  LoadUserNames(store);
+  Credential cred;
+  if (!store.LoadCredential(cred, err)) {
+    std::fprintf(stderr, "Not enrolled: %s\n", err.c_str());
+    return 2;
+  }
+
+  HttpClient http(cfg.http_timeout_sec);
+  std::vector<TerminalTarget> terminals;
+  if (cfg.discover_terminals) {
+    auto r = SignedRequest(cfg, http, cred, "GET", "/checkin/terminals", "");
+    if (r.ok) {
+      try {
+        auto j = nlohmann::json::parse(r.body);
+        auto data = j.contains("data") ? j["data"] : j;
+        if (data.is_array()) {
+          for (const auto& row : data) {
+            TerminalTarget t;
+            t.id = row.value("id", "");
+            t.name = row.value("name", "");
+            t.ip = row.value("ip_address", "");
+            t.port = row.value("port", 4370);
+            t.usage_started_on = row.value("usage_started_on", "");
+            if (t.ip.empty()) continue;
+            if (t.port <= 0) t.port = 4370;
+            terminals.push_back(std::move(t));
+          }
+        }
+      } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[attlog] catalog parse: %s\n", ex.what());
+      }
+    } else {
+      std::fprintf(stderr, "[attlog] catalog fail: %s — using config device_ip\n", r.error.c_str());
+    }
+  }
+  if (terminals.empty() && !cfg.device_ip.empty()) {
+    terminals.push_back(
+        TerminalTarget{"local", "config", cfg.device_ip, cfg.device_port, ""});
+  }
+  if (terminals.empty()) {
+    std::fprintf(stderr, "[attlog] no terminal IP configured\n");
+    return 1;
+  }
+
+  std::fprintf(stderr,
+               "[attlog] manual sync of %zu terminal(s). One TCP session each. "
+               "Device ATTLOG is not deleted.\n",
+               terminals.size());
+  OpsLog(store, "info", "attlog", "attlog_manual_start",
+         "Chạy đồng bộ nhật ký chấm công thủ công (--sync-attlog)",
+         {{"terminals", terminals.size()}});
+
+  int failed = 0;
+  for (const auto& t : terminals) {
+    if (!g_running) break;
+    service.device_session = true;
+    if (!SyncTerminalAttlog(cfg, store, http, cred, t, /*also_users=*/false)) ++failed;
+  }
+  FlushOutbox(cfg, store, http, cred, 500);
+  FlushOpsLogs(cfg, store, http, cred);
+  FlushCaptureArchives(cfg, http, cred, true);
+  const bool restart = service.resume;
+  service.Start();
+  if (restart && !SystemctlOk(std::system("systemctl is-active --quiet checkin-gateway.service"))) {
+    std::fprintf(stderr, "[attlog] checkin-gateway did not come back\n");
+    return failed > 0 ? 4 : 6;
+  }
+  if (failed > 0) {
+    std::fprintf(stderr, "[attlog] %d/%zu terminal(s) failed\n", failed, terminals.size());
+    return 4;
+  }
+  std::fprintf(stdout, "OK synced ATTLOG from %zu terminal(s) to %s/checkin/device-ingest\n",
+               terminals.size(), cfg.base_url.c_str());
+  return 0;
+}
+
 int RunGateway(const Config& cfg_in) {
   Config cfg = cfg_in;
   std::signal(SIGINT, OnSignal);
@@ -878,14 +1278,6 @@ int RunGateway(const Config& cfg_in) {
   }
 
   HttpClient http(cfg.http_timeout_sec);
-
-  struct TerminalTarget {
-    std::string id;
-    std::string name;
-    std::string ip;
-    int port = 4370;
-    std::string usage_started_on;  // YYYY-MM-DD inclusive
-  };
 
   auto parse_catalog = [&](const std::string& body, std::vector<TerminalTarget>& out) {
     out.clear();
@@ -1280,258 +1672,8 @@ int RunGateway(const Config& cfg_in) {
   };
 
   auto sync_terminal_attlog = [&](const TerminalTarget& t, bool also_users) -> bool {
-    DeviceInfo info;
-    info.ip = t.ip;
-    info.port = t.port;
-    std::string local_err;
-    const std::string tid = t.id.empty() ? t.ip : t.id;
-    std::fprintf(stderr, "[attlog] sync %s (%s) %s:%d from=%s users=%d\n", t.name.c_str(),
-                 t.id.c_str(), t.ip.c_str(), t.port,
-                 "last-success",
-                 also_users ? 1 : 0);
-    OpsLog(store, "info", "attlog", "attlog_start",
-           "Bắt đầu đồng bộ nhật ký chấm công (ATTLOG) từ máy",
-           {{"ip", t.ip},
-            {"port", t.port},
-            {"name", t.name},
-            {"also_users", also_users},
-            {"usage_started_on", t.usage_started_on}});
-
-    // T8A: attendance and the user table are each one 1503. Do not send both in the
-    // same TCP session. Exit, and only if that exit is ACK_OK wait 5s and connect
-    // again for users. A failed read or a failed exit does not open the second
-    // session. Live listen still waits 180s after this sync returns.
-    // No RecoverDevice/Enable after a bulk read.
-    std::vector<AttendanceEvent> logs;
-    std::vector<UserRecord> users;
-    bool users_pulled = false;
-    bool attlog_read_ok = false;
-    bool exit_ok = false;
-    bool users_after_gap = false;
-    size_t attlog_bytes = 0;
-    int user_count = -1;
-    int64_t read_started = 0;
-
-    {
-      ZkDevice device;
-      device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-      if (!device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec, local_err,
-                          /*allow_sensor_enable=*/false)) {
-        std::fprintf(stderr, "[attlog] connect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
-        OpsLog(store, "warn", "zk", "connect_fail",
-               "Không kết nối được máy chấm công khi đồng bộ ATTLOG",
-               {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
-                {"phase", "attlog_sync"}});
-      } else {
-        if (!device.ConnectWarning().empty()) {
-          OpsLog(store, "warn", "zk", "sensor_state_skipped",
-                 "Không đọc được trạng thái cảm biến. Vẫn đọc ATTLOG",
-                 {{"ip", t.ip}, {"port", t.port}, {"detail", device.ConnectWarning()}});
-        }
-        device.ReadDeviceInfo(info, local_err);
-        if (info.user_count > 0) user_count = info.user_count;
-
-        read_started = UnixNow();
-        if (!device.ReadAttendanceLogs(logs, local_err)) {
-          std::fprintf(stderr, "[attlog] ReadAttendanceLogs %s: %s\n", t.ip.c_str(),
-                       local_err.c_str());
-          logs.clear();
-          OpsLog(store, "warn", "attlog", "attlog_read_fail",
-                 "Đọc nhật ký chấm công từ máy thất bại",
-                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
-        } else {
-          attlog_read_ok = true;
-          attlog_bytes = device.LastAttlogBytes();
-        }
-
-        if (also_users && attlog_read_ok) {
-          if (user_count >= 0 && !UsersCatalogDue(store, tid, user_count)) {
-            std::fprintf(stderr, "[users] %s skip ReadUsers (already read today, count=%d)\n",
-                         t.ip.c_str(), user_count);
-          } else {
-            users_after_gap = true;
-          }
-        }
-
-        exit_ok = device.Disconnect();
-      }
-    }
-
-    if (users_after_gap && !exit_ok) {
-      std::fprintf(stderr, "[users] %s ATTLOG exit failed — not opening a second session\n",
-                   t.ip.c_str());
-      OpsLog(store, "warn", "users", "users_skipped_no_exit",
-             "Không đọc danh sách nhân viên vì phiên nhật ký không thoát sạch",
-             {{"ip", t.ip}, {"port", t.port}, {"name", t.name}});
-    } else if (users_after_gap && g_running) {
-      std::fprintf(stderr, "[users] %s wait 5s before a new session\n", t.ip.c_str());
-      std::this_thread::sleep_for(std::chrono::seconds(5));
-      if (g_running) {
-        ZkDevice users_device;
-        users_device.SetTzOffsetMinutes(cfg.device_tz_offset_min);
-        if (!users_device.Connect(t.ip, t.port, cfg.device_password, cfg.device_timeout_sec,
-                                  local_err, /*allow_sensor_enable=*/false)) {
-          std::fprintf(stderr, "[users] reconnect fail %s: %s\n", t.ip.c_str(), local_err.c_str());
-          OpsLog(store, "warn", "zk", "connect_fail",
-                 "Không kết nối lại được máy chấm công khi đồng bộ user id",
-                 {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err},
-                  {"phase", "users_after_attlog"}});
-        } else {
-          DeviceInfo users_info;
-          if (users_device.ReadDeviceInfo(users_info, local_err) && users_info.user_count > 0) {
-            user_count = users_info.user_count;
-          }
-          if (!users_device.ReadUsers(users, local_err)) {
-            std::fprintf(stderr, "[users] ReadUsers %s: %s\n", t.ip.c_str(), local_err.c_str());
-            users.clear();
-            OpsLog(store, "warn", "users", "users_read_fail",
-                   "Đọc danh sách user id từ máy chấm công thất bại",
-                   {{"ip", t.ip}, {"port", t.port}, {"name", t.name}, {"detail", local_err}});
-          } else {
-            users_pulled = true;
-            if (user_count < 0) user_count = static_cast<int>(users.size());
-          }
-          users_device.Disconnect();
-        }
-      }
-    }
-
-    if (users_pulled) RememberUsers(store, users);
-    if (users_pulled && UserCatalogComplete(user_count, users)) {
-      std::string meta_err;
-      if (SyncMachineUsersCatalog(cfg, store, http, cred, t.id, t.ip, users)) {
-        store.SetMeta("users_count:" + tid, std::to_string(users.size()), meta_err);
-        store.SetMeta("users_read_on:" + tid, LocalYmd(0), meta_err);
-      }
-    } else if (users_pulled) {
-      std::fprintf(stderr, "[users] %s incomplete catalog read=%zu device_count=%d (not uploaded)\n",
-                   t.ip.c_str(), users.size(), user_count);
-      OpsLog(store, "warn", "users", "users_incomplete",
-             "Đọc danh sách nhân viên không đủ so với máy — không ghi đè catalog",
-             {{"ip", t.ip}, {"read", users.size()}, {"device_count", user_count}});
-    }
-
-    if (attlog_read_ok && logs.empty() && info.log_count > 0 && attlog_bytes == 0) {
-      attlog_read_ok = false;
-      std::fprintf(stderr, "[attlog] %s empty read but device log_count=%d (fingerprint kept)\n",
-                   t.ip.c_str(), info.log_count);
-      OpsLog(store, "warn", "attlog", "attlog_incomplete",
-             "Đọc ATTLOG rỗng trong khi máy vẫn còn nhật ký — không ghi đè fingerprint",
-             {{"ip", t.ip}, {"port", t.port}, {"log_count", info.log_count}});
-    } else if (attlog_read_ok && logs.empty() && attlog_bytes > 0) {
-      // The table arrived. Rows were not valid punches. Pulling it again and opening a
-      // second session is what took this DG-600 off the LAN.
-      std::fprintf(stderr,
-                   "[attlog] %s table=%zu bytes has no valid punches (log_count=%d) — not retrying\n",
-                   t.ip.c_str(), attlog_bytes, info.log_count);
-      OpsLog(store, "warn", "attlog", "attlog_no_valid_punches",
-             "Đã đọc hết nhật ký nhưng không có dòng chấm công hợp lệ — không đọc lại ngay",
-             {{"ip", t.ip}, {"port", t.port}, {"bytes", attlog_bytes}, {"log_count", info.log_count}});
-    }
-    if (!attlog_read_ok) return false;
-
-    // Next read overlaps the transfer. The saved mark is 5 minutes before this read started.
-    constexpr int64_t kAttlogOverlapSec = 5 * 60;
-    std::string wm_raw;
-    std::string meta_wm;
-    store.GetMeta("attlog_ok_at:" + tid, wm_raw, meta_wm);
-    const int64_t watermark = wm_raw.empty() ? 0 : std::strtoll(wm_raw.c_str(), nullptr, 10);
-    // No mark yet: do not upload the whole device log. Floor is the later of
-    // usage_started_on and the last 3 local days.
-    std::string first_floor;
-    if (watermark <= 0) {
-      first_floor = LocalYmd(-2);
-      if (!t.usage_started_on.empty() && t.usage_started_on > first_floor) {
-        first_floor = t.usage_started_on;
-      }
-    }
-    auto mark_watermark = [&]() {
-      if (read_started <= kAttlogOverlapSec) return;
-      std::string e;
-      store.SetMeta("attlog_ok_at:" + tid, std::to_string(read_started - kAttlogOverlapSec), e);
-    };
-
-    std::vector<AttendanceEvent> filtered;
-    filtered.reserve(logs.size());
-    for (auto& ev : logs) {
-      if (!PunchYearOk(ev, cfg.punch_min_year)) continue;
-      if (watermark > 0) {
-        if (!PunchAtOrAfterUnix(ev, watermark)) continue;
-      } else if (!PunchOnOrAfter(ev, first_floor)) {
-        continue;
-      }
-      filtered.push_back(std::move(ev));
-    }
-    OpsLog(store, "info", "attlog", "attlog_window",
-           watermark > 0 ? "Đối soát ATTLOG từ lần đọc thành công trước"
-                         : "Đối soát ATTLOG lần đầu trong cửa sổ gần đây",
-           {{"ip", t.ip},
-            {"watermark", watermark},
-            {"first_floor", first_floor},
-            {"usage_started_on", t.usage_started_on},
-            {"raw", logs.size()},
-            {"kept", filtered.size()}});
-
-    std::string fp = FingerprintEvents(filtered);
-    std::string fp_key = "attlog_fp:" + tid;
-    std::string prev_fp;
-    std::string meta_err;
-    store.GetMeta(fp_key, prev_fp, meta_err);
-    if (!prev_fp.empty() && prev_fp == fp) {
-      bool missing = false;
-      for (const auto& ev : filtered) {
-        if (!store.SeenDedupe(DedupeKey(ev))) {
-          missing = true;
-          break;
-        }
-      }
-      if (!missing) {
-        std::fprintf(stderr, "[attlog] %s unchanged fp=%s (skip ingest)\n", t.ip.c_str(), fp.c_str());
-        OpsLog(store, "info", "attlog", "attlog_unchanged",
-               "Nhật ký chấm công không đổi — bỏ qua gửi lên server",
-               {{"ip", t.ip}, {"port", t.port}, {"raw", logs.size()}, {"filtered", filtered.size()},
-                {"fp", fp}});
-        mark_watermark();
-        return true;
-      }
-      std::fprintf(stderr, "[attlog] %s fp unchanged but some punches are not ingested yet\n",
-                   t.ip.c_str());
-    }
-
-    int enq = 0;
-    int already = 0;
-    bool enqueue_failed = false;
-    for (auto& ev : filtered) {
-      ev.from_live = false;
-      if (store.SeenDedupe(DedupeKey(ev))) {
-        ++already;
-        continue;
-      }
-      if (!EnqueuePunch(store, cfg, info, ev)) enqueue_failed = true;
-      else ++enq;
-    }
-    if (!enqueue_failed) store.SetMeta(fp_key, fp, meta_err);
-    std::fprintf(stderr, "[attlog] %s filtered=%zu/%zu enqueued=%d already=%d fp=%s\n",
-                 t.ip.c_str(), filtered.size(), logs.size(), enq, already, fp.c_str());
-    OpsLog(store, "info", "attlog", "attlog_enqueued",
-           "Đã đưa nhật ký chấm công vào hàng đợi gửi lên server",
-           {{"ip", t.ip},
-            {"port", t.port},
-            {"name", t.name},
-            {"raw", logs.size()},
-            {"filtered", filtered.size()},
-            {"enqueued", enq},
-            {"already_seen", already},
-            {"fp", fp}});
-
-    std::fprintf(stderr, "[attlog] %s kept device ATTLOG after enqueue=%d\n", t.ip.c_str(), enq);
-    OpsLog(store, "info", "attlog", "attlog_kept",
-           "Giữ nguyên nhật ký chấm công trên máy sau khi đưa vào hàng đợi",
-           {{"ip", t.ip}, {"enqueued", enq}});
-    if (!enqueue_failed) mark_watermark();
-    return !enqueue_failed;
+    return SyncTerminalAttlog(cfg, store, http, cred, t, also_users);
   };
-
   std::thread ingest_worker([&] {
     HttpClient ingest_http(cfg.http_timeout_sec);
     while (g_ingest_run) {

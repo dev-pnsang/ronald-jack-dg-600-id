@@ -15,6 +15,7 @@ Usage: checkin-gatewayctl <command> [args]
   set-device <ip> [port]  Set ZK terminal IP/port (default port 4370)
   enroll <pairing>     Enroll Device Identity once
   sync-full-user       Read every terminal user and PUT /checkin/machine-users
+  sync-attlog          Read ATTLOG now; stops checkin-gateway, then starts it again
   realtime-off         Set live_listen=false (restart gateway to apply)
   realtime-on          Set live_listen=true (restart gateway to apply)
   status               Show config + enrolled state
@@ -54,6 +55,9 @@ case "$cmd" in
     ;;
   sync-full-user)
     "$BIN" --config "$CONF" --sync-full-user
+    ;;
+  sync-attlog)
+    "$BIN" --config "$CONF" --sync-attlog
     ;;
   realtime-off)
     "$BIN" --config "$CONF" --sync-realtime-checkin-off

@@ -120,6 +120,8 @@ Lịch đồng bộ (giờ local trên gateway, cửa sổ ~90s đầu HH:MM):
 
 Chạy tay user: `sudo checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --sync-users`
 
+Chạy tay ATTLOG: `sudo checkin-gateway --config /etc/checkin-gateway/checkin-gateway.conf --sync-attlog` (cùng lệnh: `--sync-attendee`). Nếu service đang chạy thì lệnh dừng `checkin-gateway`, đọc xong chờ 180 giây rồi bật lại. Không xóa nhật ký trên máy.
+
 ## OTA (cập nhật từ xa)
 
 Sau khi có `.deb` / `.tar.gz` (gzip) + SHA-256 trên HTTPS:

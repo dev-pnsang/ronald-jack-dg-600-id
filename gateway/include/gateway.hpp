@@ -11,5 +11,7 @@ int RunEnroll(const Config& cfg, const std::string& pairing_code);
 int RunAckRotate(const Config& cfg, const std::string& secrets_json_path);
 // One-shot: ReadUsers from ZK + PUT /checkin/machine-users (force, ignore local fingerprint).
 int RunSyncUsers(const Config& cfg);
+// One-shot: read ATTLOG now and enqueue device-ingest. Does not delete logs on the device.
+int RunSyncAttlog(const Config& cfg);
 
 }  // namespace cg
