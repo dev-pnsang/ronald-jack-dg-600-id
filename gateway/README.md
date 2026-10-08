@@ -36,7 +36,9 @@ Service uses `/etc/checkin-gateway/checkin-gateway.conf` and state in `/var/lib/
 - Khi kết nối, gateway đọc trạng thái máy (`CMD_STATE_RRQ`). Đang nhận vân tay thì giữ nguyên. Đang chờ (state 0) thì bật cảm biến một lần, không thử lại, không tắt cảm biến.
 - **User id** (`PUT /checkin/machine-users`): `users_sync_times` — mặc định giống ATTLOG; có thể đặt khác (vd. `06:00`)
 
-One-shot user sync: `checkin-gateway --config … --sync-users`
+One-shot full user sync: `checkin-gateway --config … --sync-full-user` (same upload as `--sync-users`).
+
+Realtime listen is **off** unless `live_listen=true`. Toggle a running install with `--sync-realtime-checkin-off` or `--sync-realtime-checkin-on`, then restart the service. Scheduled ATTLOG sync still runs.
 
 ## Source of truth
 

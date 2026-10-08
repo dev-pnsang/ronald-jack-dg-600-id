@@ -30,9 +30,15 @@ void Usage(const char* argv0) {
                "\n"
                "Local ZK tools:\n"
                "  %s --config <path> --discover|--sync-time|--sync-users|--listen [--result-dir <dir>]\n"
+               "  %s --config <path> --sync-full-user\n"
+               "      Read every user on the terminal and PUT /checkin/machine-users\n"
+               "  %s --config <path> --sync-realtime-checkin-off\n"
+               "      Persist live_listen=false. Restart checkin-gateway to apply.\n"
+               "  %s --config <path> --sync-realtime-checkin-on\n"
+               "      Persist live_listen=true. Restart checkin-gateway to apply.\n"
                "\n"
                "Options: --log-level debug|info|warning|error\n",
-               argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+               argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 std::string DefaultResultDir() {
@@ -56,6 +62,8 @@ int main(int argc, char** argv) {
   bool discover = false;
   bool sync_time = false;
   bool sync_users = false;
+  bool realtime_off = false;
+  bool realtime_on = false;
   bool listen = false;
   bool device_set = false;
   bool server_set = false;
@@ -76,8 +84,13 @@ int main(int argc, char** argv) {
       discover = true;
     } else if (std::strcmp(argv[i], "--sync-time") == 0) {
       sync_time = true;
-    } else if (std::strcmp(argv[i], "--sync-users") == 0) {
+    } else if (std::strcmp(argv[i], "--sync-users") == 0 ||
+               std::strcmp(argv[i], "--sync-full-user") == 0) {
       sync_users = true;
+    } else if (std::strcmp(argv[i], "--sync-realtime-checkin-off") == 0) {
+      realtime_off = true;
+    } else if (std::strcmp(argv[i], "--sync-realtime-checkin-on") == 0) {
+      realtime_on = true;
     } else if (std::strcmp(argv[i], "--listen") == 0) {
       listen = true;
     } else if (std::strcmp(argv[i], "--result-dir") == 0 && i + 1 < argc) {
@@ -137,6 +150,7 @@ int main(int argc, char** argv) {
   int mode_count = static_cast<int>(enroll) + static_cast<int>(ack_rotate) +
                    static_cast<int>(discover) + static_cast<int>(sync_time) +
                    static_cast<int>(sync_users) + static_cast<int>(listen) +
+                   static_cast<int>(realtime_off) + static_cast<int>(realtime_on) +
                    static_cast<int>(device_set) + static_cast<int>(server_set) +
                    static_cast<int>(status);
   if (mode_count > 1) {
@@ -156,6 +170,18 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::fprintf(stdout, "OK base_url=%s\n", server_url.c_str());
+    std::fprintf(stdout, "Restart service: systemctl restart checkin-gateway\n");
+    return 0;
+  }
+
+  if (realtime_off || realtime_on) {
+    const char* value = realtime_on ? "true" : "false";
+    std::string err;
+    if (!cg::UpsertConfigKeys(config_path, {{"live_listen", value}}, err)) {
+      cg::LogError(err);
+      return 1;
+    }
+    std::fprintf(stdout, "OK live_listen=%s\n", value);
     std::fprintf(stdout, "Restart service: systemctl restart checkin-gateway\n");
     return 0;
   }
@@ -210,6 +236,7 @@ int main(int argc, char** argv) {
                  cfg.attlog_sync_times.empty() ? "12:00,23:00" : cfg.attlog_sync_times.c_str());
     std::fprintf(stdout, "users_sync=%s\n",
                  cfg.users_sync_times.empty() ? "12:00,23:00" : cfg.users_sync_times.c_str());
+    std::fprintf(stdout, "live_listen=%s\n", cfg.live_listen ? "true" : "false");
     std::fprintf(stdout, "enrolled=%s\n", enrolled ? "true" : "false");
     if (enrolled) std::fprintf(stdout, "device_id=%s\n", device_id.c_str());
     return 0;

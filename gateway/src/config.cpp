@@ -50,7 +50,7 @@ bool LoadConfig(const std::string& path, Config& out, std::string& err) {
       } else if (key == "data_dir") out.data_dir = val;
       else if (key == "agent_name") out.agent_name = val;
       else if (key == "agent_version") out.agent_version = val;
-      else if (key == "live_listen") out.live_listen = ParseBool(val, true);
+      else if (key == "live_listen") out.live_listen = ParseBool(val, false);
       else if (key == "poll_fallback") out.poll_fallback = ParseBool(val, true);
       else if (key == "discover_terminals") out.discover_terminals = ParseBool(val, true);
       else if (key == "catalog_refresh_sec") out.catalog_refresh_sec = std::stoi(val);

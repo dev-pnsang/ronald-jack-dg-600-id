@@ -18,7 +18,9 @@ agent_version=1.2.8
 
 # ATTLOG: gateway syncs twice daily at local 12:00 and 23:00 only,
 # filtering punches from attendance_devices.usage_started_on; skips if fingerprint unchanged.
-live_listen=true
+# Realtime RegEvent listen. Off by default; scheduled ATTLOG still runs.
+# Toggle: checkin-gateway --config <path> --sync-realtime-checkin-off|--sync-realtime-checkin-on
+live_listen=false
 # Also pull ATTLOG periodically (covers missed live events after reconnect)
 poll_fallback=false
 # Pull attendance_devices (with IP) from server and poll each terminal
